@@ -174,7 +174,44 @@ function connectWS() {
   ws.onopen    = () => console.log("[Shorts] WS connected");
   ws.onerror   = () => console.warn("[Shorts] WS error — bridge.py running?");
   ws.onclose   = () => setTimeout(connectWS, 3000);
-  ws.onmessage = (m) => onGazeFrame(JSON.parse(m.data));
+  ws.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.gesture) {
+      onHandGesture(d.gesture);
+    } else {
+      onGazeFrame(d);
+    }
+  };
+}
+
+// ── Hand-gesture handler (manual swipe via wrist motion) ────────────────────
+let _lastGestureTs = 0;
+function onHandGesture(direction) {
+  const now = Date.now();
+  if (now - _lastGestureTs < 700) return;   // debounce
+  _lastGestureTs = now;
+  console.log(`[Shorts] hand gesture → ${direction}`);
+  showVerdict(direction === "next" ? "👋 NEXT" : "👋 BACK", "#7c4dff");
+  // Cancel any pending auto-skip countdown
+  countdown = null;
+  if (document.activeElement && document.activeElement.blur) {
+    document.activeElement.blur();
+  }
+  document.body.focus();
+  const video = document.querySelector("video");
+  if (video) try { video.focus(); } catch(e) {}
+  const key = direction === "next" ? "ArrowDown" : "ArrowUp";
+  const code = direction === "next" ? "ArrowDown" : "ArrowUp";
+  const keyCode = direction === "next" ? 40 : 38;
+  ["keydown", "keyup"].forEach(type => {
+    const e = new KeyboardEvent(type, {
+      key, code, keyCode, which: keyCode,
+      bubbles: true, cancelable: true,
+    });
+    document.dispatchEvent(e);
+    if (video) video.dispatchEvent(e);
+  });
+  lastSkipTs = now;   // share cooldown with auto-skip
 }
 
 let _frameCount = 0;
