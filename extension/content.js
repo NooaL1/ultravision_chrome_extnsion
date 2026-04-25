@@ -178,10 +178,33 @@ function connectWS() {
     const d = JSON.parse(m.data);
     if (d.gesture) {
       onHandGesture(d.gesture);
+    } else if (d.face) {
+      onFaceMetrics(d.face);
     } else {
       onGazeFrame(d);
     }
   };
+}
+
+// ── Face-expression handler (from webcam) ───────────────────────────────────
+let latestFace = null;     // {smile, mouth_open, brow}  (deltas vs baseline)
+let _lastFaceTs = 0;
+function onFaceMetrics(face) {
+  latestFace = face;
+  _lastFaceTs = Date.now();
+}
+
+// Combine face deltas into a small engagement boost (-30..+30) on the boredom
+// score. Smile or surprise → reduces boredom; flat face → no effect.
+function faceEngagementDelta() {
+  if (!latestFace || Date.now() - _lastFaceTs > 2000) return 0;
+  const f = latestFace;
+  // smile/mouth/brow are normalised relative changes. Cap them.
+  const smile = Math.max(-0.3, Math.min(0.5, f.smile || 0));
+  const open  = Math.max(-0.3, Math.min(0.8, f.mouth_open || 0));
+  const brow  = Math.max(-0.3, Math.min(0.4, f.brow || 0));
+  // Positive smile/open/brow lower boredom. Multiply for sensitivity.
+  return -(smile * 40 + open * 25 + brow * 30);
 }
 
 // ── Hand-gesture handler (manual swipe via wrist motion) ────────────────────
@@ -292,14 +315,21 @@ function onGazeFrame(d) {
   const sig = computeBoredom();
   latestSignals = sig;
 
-  if (sig.score > BOREDOM_THRESH) {
+  // Apply face-expression engagement delta to the score
+  const faceDelta = faceEngagementDelta();
+  const adjScore = Math.max(0, Math.min(100, sig.score + faceDelta));
+  sig.faceDelta = faceDelta;
+  sig.adjScore  = adjScore;
+
+  if (adjScore > BOREDOM_THRESH) {
     // Start the countdown instead of immediate skip
     const recent = pupilSamples.slice(-Math.ceil(COUNTDOWN_BASELINE_S * 30));
     const baseline = recent.length
       ? recent.reduce((a,b)=>a+b.p,0) / recent.length
       : null;
     countdown = { startTs: Date.now(), baseline };
-    console.log(`[Shorts] boredom ${sig.score} > ${BOREDOM_THRESH} → countdown`);
+    console.log(`[Shorts] boredom ${sig.score} + face ${faceDelta.toFixed(0)} `
+              + `= ${adjScore} > ${BOREDOM_THRESH} → countdown`);
   }
 }
 
@@ -460,6 +490,16 @@ function ensureDashboard() {
 
     <div id="__d_signals__"></div>
 
+    <div id="__d_face__" style="margin-top:8px;font:11px ui-monospace;
+         padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.04);
+         line-height:1.5;">
+      <div style="display:flex;justify-content:space-between;
+                  font-size:10px;opacity:.7;margin-bottom:2px;">
+        <span>FACE</span><span id="__d_face_delta__">--</span>
+      </div>
+      <span id="__d_face_vals__" style="opacity:.85;">no face</span>
+    </div>
+
     <div id="__d_event__" style="display:flex;gap:8px;margin-top:10px;
          justify-content:center;">
       <span id="__d_blink__" style="padding:3px 8px;border-radius:6px;
@@ -590,6 +630,30 @@ function updateDashboard() {
     const flash = nowMs - _lastSaccFlash < 200;
     saccEl.style.background = flash ? "#ffd400" : "rgba(255,255,255,0.08)";
     saccEl.textContent = `↯ ${saccadeTimes.length}`;
+  }
+
+  // Face row
+  const faceVals = document.getElementById("__d_face_vals__");
+  const faceDelta = document.getElementById("__d_face_delta__");
+  if (faceVals && faceDelta) {
+    if (latestFace && Date.now() - _lastFaceTs < 2000) {
+      const f = latestFace;
+      const fmt = (k, v) => {
+        const c = v > 0.05 ? "#00d060" : v > -0.05 ? "#ffd400" : "#ff4040";
+        return `<span style="color:${c};">${k} ${v>=0?"+":""}${v.toFixed(2)}</span>`;
+      };
+      faceVals.innerHTML =
+          fmt("smile", f.smile||0) + " "
+        + fmt("mouth", f.mouth_open||0) + " "
+        + fmt("brow",  f.brow||0);
+      const delta = sig.faceDelta != null ? sig.faceDelta : 0;
+      const dColor = delta < -2 ? "#00d060" : delta > 2 ? "#ff4040" : "#9e9e9e";
+      faceDelta.style.color = dColor;
+      faceDelta.textContent = (delta>=0?"+":"") + delta.toFixed(0);
+    } else {
+      faceVals.textContent = "no face";
+      faceDelta.textContent = "--";
+    }
   }
 
   // Threshold indicator

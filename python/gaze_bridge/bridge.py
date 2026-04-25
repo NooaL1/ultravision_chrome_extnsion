@@ -254,6 +254,172 @@ def gesture_worker(remote_ip: str, gesture_q):
             break
 
 
+# ── Webcam worker (face expression + secondary hand tracking) ──────────────
+def webcam_worker(gesture_q, cam_index=0):
+    """Reads laptop webcam → MediaPipe face mesh + hands. Pushes face
+    expression metrics + (optional) gesture events into the queue.
+    Runs in its own process so cv2.imshow works on Windows."""
+    import cv2 as cv
+    import mediapipe as mp
+
+    cap = cv.VideoCapture(cam_index, cv.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv.VideoCapture(cam_index)
+    if not cap.isOpened():
+        print(f"[Webcam] no camera at index {cam_index} — disabled")
+        return
+    print(f"[Webcam] opened camera {cam_index}")
+
+    face_mesh = mp.solutions.face_mesh.FaceMesh(
+        max_num_faces=1, refine_landmarks=True,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5,
+    )
+    hands = mp.solutions.hands.Hands(
+        max_num_hands=1,
+        min_detection_confidence=0.55, min_tracking_confidence=0.45,
+    )
+
+    cv.namedWindow("Webcam debug", cv.WINDOW_NORMAL)
+    cv.resizeWindow("Webcam debug", 700, 500)
+
+    last_face_send = 0.0
+    last_swipe_ts  = 0.0
+    pinching       = False
+    grab_start_y   = None
+
+    # Expression baselines (estimated over first 3 s of frames)
+    baseline = {"smile": None, "mouth_open": None, "brow": None}
+    baseline_samples = {"smile": [], "mouth_open": [], "brow": []}
+    BASELINE_FRAMES  = 60
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            time.sleep(0.05)
+            continue
+        frame = cv.flip(frame, 1)            # selfie mirror
+        h, w  = frame.shape[:2]
+        rgb   = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+
+        face_results = None
+        hand_results = None
+        try:
+            face_results = face_mesh.process(rgb)
+        except Exception as exc:
+            pass
+        try:
+            hand_results = hands.process(rgb)
+        except Exception as exc:
+            pass
+
+        now = time.time()
+        face_metrics = None
+
+        # ── Face expression metrics ──────────────────────────────────────────
+        if face_results and face_results.multi_face_landmarks:
+            lm = face_results.multi_face_landmarks[0].landmark
+            # Face-width normaliser (distance between cheeks)
+            left_cheek  = lm[234]
+            right_cheek = lm[454]
+            face_w = max(0.01, ((right_cheek.x - left_cheek.x) ** 2 +
+                                 (right_cheek.y - left_cheek.y) ** 2) ** 0.5)
+            # Smile: mouth corner horizontal distance / face width
+            left_corner  = lm[61];  right_corner = lm[291]
+            smile = (((right_corner.x - left_corner.x) ** 2 +
+                      (right_corner.y - left_corner.y) ** 2) ** 0.5) / face_w
+            # Mouth open: vertical lip distance / face width
+            upper_lip = lm[13]; lower_lip = lm[14]
+            mouth_open = abs(upper_lip.y - lower_lip.y) / face_w
+            # Brow raise: brow to eye distance / face width
+            left_brow = lm[105]; left_eye_top = lm[159]
+            brow = abs(left_brow.y - left_eye_top.y) / face_w
+
+            metrics = {"smile": smile, "mouth_open": mouth_open, "brow": brow}
+
+            # Establish baseline during first N frames
+            for k, v in metrics.items():
+                if baseline[k] is None and len(baseline_samples[k]) < BASELINE_FRAMES:
+                    baseline_samples[k].append(v)
+                    if len(baseline_samples[k]) == BASELINE_FRAMES:
+                        baseline[k] = sum(baseline_samples[k]) / BASELINE_FRAMES
+                        print(f"[Webcam] baseline {k}={baseline[k]:.4f}")
+
+            # Compute deltas vs baseline (clip to roughly -1..+1)
+            face_metrics = {}
+            for k, v in metrics.items():
+                if baseline[k]:
+                    face_metrics[k] = (v - baseline[k]) / baseline[k]
+                else:
+                    face_metrics[k] = 0.0
+
+            # Draw key landmarks
+            for idx, color in [(13,(0,255,255)), (14,(0,255,255)),
+                               (61,(255,0,255)), (291,(255,0,255)),
+                               (105,(0,200,0)), (159,(0,200,0)),
+                               (234,(150,150,150)),(454,(150,150,150))]:
+                p = lm[idx]
+                cv.circle(frame, (int(p.x*w), int(p.y*h)), 3, color, -1)
+
+            # Send periodically
+            if now - last_face_send > 0.4:
+                msg = {"face": face_metrics, "ts": now}
+                try:
+                    gesture_q.put_nowait(msg)
+                except Exception:
+                    pass
+                last_face_send = now
+
+        # ── Hands (pinch-grab swipe from webcam side) ────────────────────────
+        if hand_results and hand_results.multi_hand_landmarks:
+            lm = hand_results.multi_hand_landmarks[0]
+            wrist = lm.landmark[0]
+            thumb = lm.landmark[4]; index = lm.landmark[8]
+            pd = ((thumb.x - index.x)**2 + (thumb.y - index.y)**2) ** 0.5
+            if not pinching and pd < PINCH_ON_DIST:
+                pinching = True; grab_start_y = wrist.y
+            elif pinching and pd > PINCH_OFF_DIST:
+                pinching = False
+                d = wrist.y - grab_start_y
+                if abs(d) > DRAG_THRESHOLD and now - last_swipe_ts > SWIPE_COOLDOWN_S:
+                    g = "next" if d < 0 else "prev"
+                    print(f"[Webcam] SWIPE {g.upper()} (Δy {d:+.2f})")
+                    last_swipe_ts = now
+                    try:
+                        gesture_q.put_nowait({"gesture": g, "ts": now,
+                                              "source": "webcam"})
+                    except Exception:
+                        pass
+                grab_start_y = None
+            mp.solutions.drawing_utils.draw_landmarks(
+                frame, lm, mp.solutions.hands.HAND_CONNECTIONS,
+            )
+
+        # ── Debug overlays ────────────────────────────────────────────────────
+        y0 = 25
+        cv.putText(frame, "Webcam: face + hand", (10, y0),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv.LINE_AA)
+        if face_metrics:
+            for i, (k, v) in enumerate(face_metrics.items()):
+                color = (0,255,0) if v > 0.05 else (0,180,255) if v > -0.05 else (80,80,255)
+                cv.putText(frame, f"{k:11s} {v:+.2f}",
+                           (10, y0 + 25 + i*22),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv.LINE_AA)
+        else:
+            cv.putText(frame, "no face", (10, y0+25),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.55, (80,80,255), 2)
+
+        if pinching:
+            cv.putText(frame, "GRABBED", (10, h-20),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv.LINE_AA)
+
+        cv.imshow("Webcam debug", frame)
+        if cv.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv.destroyAllWindows()
+
+
 # ── Bridge between gesture queue and WS broadcast (asyncio) ─────────────────
 async def gesture_relay(q):
     while True:
@@ -275,6 +441,12 @@ async def main():
                        daemon=True)
     proc.start()
     print(f"[Bridge] gesture worker pid={proc.pid}")
+
+    # Webcam worker (face expression + secondary hand tracking)
+    cam_proc = mpr.Process(target=webcam_worker, args=(gesture_q, 0),
+                           daemon=True)
+    cam_proc.start()
+    print(f"[Bridge] webcam worker pid={cam_proc.pid}")
 
     server = await serve(ws_handler, WS_HOST, WS_PORT)
     print(f"[WS] listening on ws://{WS_HOST}:{WS_PORT}")
