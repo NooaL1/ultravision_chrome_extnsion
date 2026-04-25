@@ -23,7 +23,7 @@ DWELL_RADIUS   = 60    # pixel radius gaze must stay within
 PUPIL_CHANGE_THRESHOLD = 0.08   # 8% pupil diameter change triggers search
 
 # Person-overlay colours  (BGR)
-PERSON_BOX_COLOR  = (0, 200, 255)   # amber/gold
+PERSON_BOX_COLOR  = (130, 0, 75)   # indigo
 UNKNOWN_BOX_COLOR = (120, 120, 120) # grey for unrecognised faces
 
 # Category → colour mapping
@@ -151,7 +151,7 @@ PEOPLE_REGISTRY: list[dict] = [
 
     {"name": "Faisal", "age": 23, "role": "Student",
          "photo_path": r"C:\\Users\\Pavel\\Pictures\\faisalphoto.jpg"},
-         {"name": "Sai", "age": 26, "role": "Engineer",
+    {"name": "Sai", "age": 26, "role": "Engineer",
          "photo_path": r"C:\\Users\\Pavel\\Pictures\\saikiran.jpg"},
     # ← ADD YOUR ENTRIES HERE ↓
     # {"name": "Alice Smith",   "age": 29, "role": "Engineer",    "photo_path": "photos/alice.jpg"},
@@ -317,7 +317,7 @@ class process:
                     box           = (x1, y1, x2, y2),
                     label         = f"{cls_name} {conf:.0%}",
                     class_name    = cls_name,
-                    color         = _class_color(cls_name),
+                    color         = _category_color(cls_name),
                     expires_at    = time.time() + HIGHLIGHT_FADE,
                     link_status   = "searching",
                     product_price = "",
