@@ -1,4 +1,5 @@
 pyzmq
-opencv-python
+opencv-contrib-python
 numpy
 ultralytics
+pyttsx3

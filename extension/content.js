@@ -1,0 +1,462 @@
+// content.js — YouTube Shorts Auto-Swiper (with live dashboard + save gesture)
+
+const WS_URL           = "ws://localhost:8765";
+const ROLLING_SEC      = 2.5;
+const SETTLE_SEC       = 0.5;
+const CHECK_EVERY_MS   = 500;
+let BOREDOM_THRESH = parseInt(
+  localStorage.getItem("__shorts_boredom_thresh__") || "80", 10
+);
+const THRESH_STEP = 3;
+const THRESH_MIN  = 20;
+const THRESH_MAX  = 95;
+const SKIP_COOLDOWN_MS = 800;
+const VERDICT_HOLD_MS  = 800;
+
+// Skip-countdown / save-gesture
+const COUNTDOWN_MS         = 1500;     // grace window before actually skipping
+const SAVE_DILATION_RATIO  = 0.03;     // 3% pupil rise during countdown = save
+const COUNTDOWN_BASELINE_S = 1.0;      // pupil window used for save baseline
+
+let lastUrl       = location.href;
+let shortStart    = 0;
+let pupilSamples  = [];
+let blinkTimes    = [];
+let saccadeTimes  = [];
+let blinks        = 0;
+let saccades      = 0;
+let lastEvent     = "";
+let lastCheckMs   = 0;
+let lastSkipTs    = 0;
+let latestSignals = null;             // last computed boredom breakdown
+let countdown     = null;             // active skip countdown {startTs, baseline}
+
+// ── Reset state on every new Short ───────────────────────────────────────────
+function resetForNewShort() {
+  shortStart    = performance.now() / 1000;
+  pupilSamples  = [];
+  blinkTimes    = [];
+  saccadeTimes  = [];
+  blinks        = 0;
+  saccades      = 0;
+  lastEvent     = "";
+  lastCheckMs   = 0;
+  countdown     = null;
+  console.log("[Shorts] reset for new short", location.href);
+}
+
+function isOnShort() {
+  return location.pathname.startsWith("/shorts/");
+}
+
+setInterval(() => {
+  if (location.href !== lastUrl) {
+    lastUrl = location.href;
+    if (isOnShort()) resetForNewShort();
+  }
+}, 250);
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+function connectWS() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen    = () => console.log("[Shorts] WS connected");
+  ws.onerror   = () => console.warn("[Shorts] WS error — bridge.py running?");
+  ws.onclose   = () => setTimeout(connectWS, 3000);
+  ws.onmessage = (m) => onGazeFrame(JSON.parse(m.data));
+}
+
+let _frameCount = 0;
+let _lastBlinkFlash = 0, _lastSaccFlash = 0;
+function onGazeFrame(d) {
+  _frameCount++;
+  const now = performance.now() / 1000;
+  const pupil = (d.pupilL + d.pupilR) / 2;
+
+  if (!isOnShort()) return;
+  if (shortStart === 0) resetForNewShort();
+
+  const elapsed = now - shortStart;
+
+  // Blink + saccade tracking
+  const ev = d.event || "";
+  if (ev === "BB" && lastEvent !== "BB") {
+    blinkTimes.push(now);
+    _lastBlinkFlash = performance.now();
+  }
+  if ((ev === "S" || ev.startsWith("FE")) && lastEvent !== ev) {
+    saccadeTimes.push(now);
+    _lastSaccFlash = performance.now();
+  }
+  lastEvent = ev;
+
+  // Pupil sample
+  if (elapsed >= SETTLE_SEC && pupil > 0) {
+    pupilSamples.push({t: now, p: pupil});
+  }
+
+  // Trim rolling window
+  const cutoff = now - ROLLING_SEC;
+  while (pupilSamples.length && pupilSamples[0].t < cutoff) pupilSamples.shift();
+  while (blinkTimes.length   && blinkTimes[0]   < cutoff) blinkTimes.shift();
+  while (saccadeTimes.length && saccadeTimes[0] < cutoff) saccadeTimes.shift();
+
+  // Update dashboard every frame
+  updateDashboard();
+
+  // ── Countdown phase: monitoring for save gesture ──────────────────────────
+  if (countdown) {
+    const dt = Date.now() - countdown.startTs;
+    // Check current pupil vs frozen baseline
+    const recent = pupilSamples.slice(-Math.max(3, pupilSamples.length >> 2));
+    if (recent.length >= 3 && countdown.baseline) {
+      const recAvg = recent.reduce((a,b)=>a+b.p,0) / recent.length;
+      const ratio  = (recAvg - countdown.baseline) / countdown.baseline;
+      if (ratio >= SAVE_DILATION_RATIO) {
+        // SAVED!
+        showVerdict(`SAVED!`, "#00d060");
+        console.log(`[Shorts] SAVED — pupil rose ${(ratio*100).toFixed(1)}% during countdown`);
+        countdown = null;
+        lastSkipTs = Date.now();   // hold off until next check window
+        return;
+      }
+    }
+    if (dt >= COUNTDOWN_MS) {
+      // Countdown finished — actually skip
+      console.log("[Shorts] countdown finished → executing skip");
+      showVerdict(`SKIP`, "#ff4040");
+      skipToNext();
+      countdown = null;
+      lastSkipTs = Date.now();
+    }
+    return;   // skip normal evaluation while countdown active
+  }
+
+  // HUD: settle indicator
+  if (elapsed < SETTLE_SEC) return;
+
+  // Time-based check
+  const nowMs = Date.now();
+  if (nowMs - lastCheckMs < CHECK_EVERY_MS) return;
+  if (nowMs - lastSkipTs < SKIP_COOLDOWN_MS) return;
+  lastCheckMs = nowMs;
+
+  const sig = computeBoredom();
+  latestSignals = sig;
+
+  if (sig.score > BOREDOM_THRESH) {
+    // Start the countdown instead of immediate skip
+    const recent = pupilSamples.slice(-Math.ceil(COUNTDOWN_BASELINE_S * 30));
+    const baseline = recent.length
+      ? recent.reduce((a,b)=>a+b.p,0) / recent.length
+      : null;
+    countdown = { startTs: Date.now(), baseline };
+    console.log(`[Shorts] boredom ${sig.score} > ${BOREDOM_THRESH} → countdown`);
+  }
+}
+
+function computeBoredom() {
+  if (pupilSamples.length < 4) {
+    return {score: 30, pupilDrop:0, flatScore:0, blinkScore:0, saccScore:0,
+            slope:0, cv:0, blinkRate:0, saccRate:0};
+  }
+  const vals = pupilSamples.map(s => s.p);
+  const ts   = pupilSamples.map(s => s.t);
+  const n    = vals.length;
+  const mean = vals.reduce((a,b)=>a+b,0) / n;
+  const winSec = Math.max(0.5, ROLLING_SEC);
+  const blinks   = blinkTimes.length;
+  const saccades = saccadeTimes.length;
+
+  let sumXY=0, sumX=0, sumY=0, sumXX=0;
+  for (let i=0; i<n; i++) {
+    sumX += ts[i]; sumY += vals[i];
+    sumXY += ts[i]*vals[i]; sumXX += ts[i]*ts[i];
+  }
+  const slope     = (n*sumXY - sumX*sumY) / (n*sumXX - sumX*sumX || 1);
+  const slopeNorm = slope / (mean || 1);
+  let pupilDrop = 0;
+  if (slopeNorm < 0) pupilDrop = Math.min(100, -slopeNorm * 2500);
+
+  let varSum = 0;
+  for (const v of vals) varSum += (v - mean) ** 2;
+  const cv = Math.sqrt(varSum / n) / (mean || 1);
+  let flatScore = 0;
+  if      (cv < 0.003) flatScore = 80;
+  else if (cv < 0.006) flatScore = 50;
+  else if (cv < 0.010) flatScore = 20;
+
+  const blinkRate = blinks / winSec;
+  let blinkScore = 0;
+  if      (blinkRate > 0.8) blinkScore = 100;
+  else if (blinkRate > 0.5) blinkScore = 75;
+  else if (blinkRate > 0.3) blinkScore = 35;
+
+  const saccRate = saccades / winSec;
+  let saccScore = 0;
+  if      (saccRate > 3.5) saccScore = 95;
+  else if (saccRate > 2.5) saccScore = 70;
+  else if (saccRate > 1.5) saccScore = 30;
+
+  const signals = [pupilDrop, flatScore, blinkScore, saccScore];
+  const top = Math.max(...signals);
+  const avg = signals.reduce((a,b)=>a+b,0) / signals.length;
+  const score = Math.round(top * 0.7 + avg * 0.3);
+
+  return {score, pupilDrop, flatScore, blinkScore, saccScore,
+          slope: slopeNorm, cv, blinkRate, saccRate};
+}
+
+function skipToNext() {
+  if (document.activeElement && document.activeElement.blur) {
+    document.activeElement.blur();
+  }
+  document.body.focus();
+  const video = document.querySelector("video");
+  if (video) try { video.focus(); } catch(e) {}
+  ["keydown", "keyup"].forEach(type => {
+    const e = new KeyboardEvent(type, {
+      key: "ArrowDown", code: "ArrowDown", keyCode: 40, which: 40,
+      bubbles: true, cancelable: true,
+    });
+    document.dispatchEvent(e);
+    if (video) video.dispatchEvent(e);
+  });
+}
+
+// ── Verdict popup ───────────────────────────────────────────────────────────
+function showVerdict(text, color) {
+  let v = document.getElementById("__shorts_verdict__");
+  if (!v) {
+    v = document.createElement("div");
+    v.id = "__shorts_verdict__";
+    Object.assign(v.style, {
+      position: "fixed", top: "30%", left: "50%",
+      transform: "translate(-50%, -50%)",
+      padding: "20px 40px", borderRadius: "16px",
+      font: "bold 56px system-ui, sans-serif",
+      color: "#fff",
+      zIndex: 2147483647, pointerEvents: "none",
+      boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+    });
+    document.body.appendChild(v);
+  }
+  v.textContent = text;
+  v.style.background = color;
+  v.style.opacity = "1";
+  v.style.transition = "opacity 0.4s";
+  setTimeout(() => { v.style.opacity = "0"; }, VERDICT_HOLD_MS - 400);
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(text.split(" ")[0]));
+}
+
+// ── Live dashboard (sidebar) ────────────────────────────────────────────────
+function ensureDashboard() {
+  let d = document.getElementById("__shorts_dash__");
+  if (d) return d;
+  d = document.createElement("div");
+  d.id = "__shorts_dash__";
+  Object.assign(d.style, {
+    position: "fixed", top: "70px", right: "20px",
+    width: "260px", padding: "14px",
+    background: "rgba(15,15,20,0.92)", color: "#fff",
+    borderRadius: "14px", border: "1px solid rgba(255,255,255,0.1)",
+    font: "13px ui-monospace, Menlo, monospace",
+    zIndex: 2147483647, pointerEvents: "none",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+    backdropFilter: "blur(8px)",
+  });
+  d.innerHTML = `
+    <div style="font:bold 14px system-ui;margin-bottom:10px;letter-spacing:.5px;">
+      🎯 GAZE SIGNALS
+    </div>
+    <div style="position:relative;height:90px;width:90px;margin:0 auto 8px;">
+      <svg width="90" height="90" viewBox="0 0 90 90" style="transform:rotate(-90deg);">
+        <circle cx="45" cy="45" r="38" stroke="rgba(255,255,255,0.1)"
+                stroke-width="8" fill="none"/>
+        <circle id="__d_arc__" cx="45" cy="45" r="38" stroke="#00d060"
+                stroke-width="8" fill="none" stroke-linecap="round"
+                stroke-dasharray="0 999" />
+      </svg>
+      <div id="__d_score__" style="position:absolute;inset:0;display:flex;
+           align-items:center;justify-content:center;font:bold 26px system-ui;">
+        --
+      </div>
+    </div>
+    <div id="__d_state__" style="text-align:center;font:bold 12px system-ui;
+         margin-bottom:10px;letter-spacing:1px;">HOOKED</div>
+
+    <div style="margin:8px 0;">
+      <div style="display:flex;justify-content:space-between;font-size:10px;
+                  opacity:0.7;margin-bottom:2px;">
+        <span>PUPIL ${ROLLING_SEC}s</span><span id="__d_pupil_val__">--</span>
+      </div>
+      <svg id="__d_pupil__" width="100%" height="36" viewBox="0 0 232 36"
+           preserveAspectRatio="none" style="background:rgba(255,255,255,0.04);
+           border-radius:4px;display:block;">
+        <polyline id="__d_pupil_line__" points="" fill="none"
+                  stroke="#3ea6ff" stroke-width="1.5"/>
+      </svg>
+    </div>
+
+    <div id="__d_signals__"></div>
+
+    <div id="__d_event__" style="display:flex;gap:8px;margin-top:10px;
+         justify-content:center;">
+      <span id="__d_blink__" style="padding:3px 8px;border-radius:6px;
+            background:rgba(255,255,255,0.08);font-size:11px;">👁 0</span>
+      <span id="__d_sacc__"  style="padding:3px 8px;border-radius:6px;
+            background:rgba(255,255,255,0.08);font-size:11px;">↯ 0</span>
+    </div>
+
+    <div style="margin-top:10px;font-size:10px;opacity:0.5;text-align:center;">
+      THRESH <span id="__d_thresh__">${BOREDOM_THRESH}</span> &nbsp; , = stricter . = looser
+    </div>
+  `;
+  document.body.appendChild(d);
+  return d;
+}
+
+function renderSignalRow(label, value, max=100) {
+  const pct = Math.max(0, Math.min(100, value));
+  const color = pct > 50 ? "#ff4040" : pct > 25 ? "#ffd400" : "#3ea6ff";
+  return `
+    <div style="display:flex;align-items:center;gap:6px;margin:3px 0;font-size:11px;">
+      <span style="width:60px;opacity:0.8;">${label}</span>
+      <div style="flex:1;height:6px;background:rgba(255,255,255,0.08);
+                  border-radius:3px;overflow:hidden;">
+        <div style="width:${pct}%;height:100%;background:${color};
+                    transition:width 0.2s;"></div>
+      </div>
+      <span style="width:24px;text-align:right;opacity:0.6;">${value|0}</span>
+    </div>`;
+}
+
+function updateDashboard() {
+  const d = ensureDashboard();
+
+  // Pupil graph: map pupilSamples to SVG polyline
+  if (pupilSamples.length >= 2) {
+    const vals = pupilSamples.map(s => s.p);
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const range = Math.max(0.1, max - min);
+    const now = pupilSamples[pupilSamples.length-1].t;
+    const tStart = now - ROLLING_SEC;
+    const points = pupilSamples.map(s => {
+      const x = ((s.t - tStart) / ROLLING_SEC) * 232;
+      const y = 32 - ((s.p - min) / range) * 28;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    document.getElementById("__d_pupil_line__")?.setAttribute("points", points);
+    document.getElementById("__d_pupil_val__")
+      ?.replaceChildren(document.createTextNode(vals[vals.length-1].toFixed(2)));
+  }
+
+  // Signal bars + score gauge
+  const sig = latestSignals || {score:0, pupilDrop:0, flatScore:0,
+                                  blinkScore:0, saccScore:0};
+  const score = sig.score;
+  const arcLen = 238.76;   // 2π*38
+  const dash = (score/100) * arcLen;
+  const arc = document.getElementById("__d_arc__");
+  if (arc) {
+    arc.setAttribute("stroke-dasharray", `${dash} 999`);
+    arc.setAttribute("stroke",
+      score > BOREDOM_THRESH ? "#ff4040"
+      : score > BOREDOM_THRESH * 0.7 ? "#ffd400"
+      : "#00d060");
+  }
+  const sc = document.getElementById("__d_score__");
+  if (sc) sc.textContent = score;
+
+  const state = countdown
+    ? `⚠ SKIPPING in ${((COUNTDOWN_MS-(Date.now()-countdown.startTs))/1000).toFixed(1)}s`
+    : score > BOREDOM_THRESH ? "BORED"
+    : "HOOKED";
+  const stateEl = document.getElementById("__d_state__");
+  if (stateEl) {
+    stateEl.textContent = state;
+    stateEl.style.color = countdown ? "#ffd400"
+                          : score > BOREDOM_THRESH ? "#ff4040" : "#00d060";
+  }
+
+  const sigsEl = document.getElementById("__d_signals__");
+  if (sigsEl) {
+    sigsEl.innerHTML =
+        renderSignalRow("PUP DROP",  sig.pupilDrop)
+      + renderSignalRow("PUP FLAT",  sig.flatScore)
+      + renderSignalRow("BLINKS",    sig.blinkScore)
+      + renderSignalRow("SACCADES",  sig.saccScore);
+  }
+
+  // Flash blink/saccade pills on event
+  const nowMs = performance.now();
+  const blinkEl = document.getElementById("__d_blink__");
+  const saccEl  = document.getElementById("__d_sacc__");
+  if (blinkEl) {
+    const flash = nowMs - _lastBlinkFlash < 200;
+    blinkEl.style.background = flash ? "#3ea6ff" : "rgba(255,255,255,0.08)";
+    blinkEl.textContent = `👁 ${blinkTimes.length}`;
+  }
+  if (saccEl) {
+    const flash = nowMs - _lastSaccFlash < 200;
+    saccEl.style.background = flash ? "#ffd400" : "rgba(255,255,255,0.08)";
+    saccEl.textContent = `↯ ${saccadeTimes.length}`;
+  }
+
+  // Threshold indicator
+  document.getElementById("__d_thresh__").textContent = BOREDOM_THRESH;
+}
+
+// ── Adaptive threshold via keyboard ─────────────────────────────────────────
+function adjustThresh(delta, label) {
+  BOREDOM_THRESH = Math.max(THRESH_MIN, Math.min(THRESH_MAX,
+                                                  BOREDOM_THRESH + delta));
+  localStorage.setItem("__shorts_boredom_thresh__", String(BOREDOM_THRESH));
+  console.log(`[Shorts] threshold → ${BOREDOM_THRESH} (${label})`);
+  showToast(`${label}  threshold: ${BOREDOM_THRESH}`,
+            delta > 0 ? "#1976d2" : "#e53935");
+}
+
+function showToast(text, color) {
+  let t = document.getElementById("__shorts_toast__");
+  if (!t) {
+    t = document.createElement("div");
+    t.id = "__shorts_toast__";
+    Object.assign(t.style, {
+      position: "fixed", bottom: "60px", left: "50%",
+      transform: "translateX(-50%)",
+      padding: "20px 36px", borderRadius: "16px",
+      color: "#fff", font: "bold 28px system-ui, sans-serif",
+      zIndex: 2147483647, pointerEvents: "none",
+      transition: "opacity 0.4s, transform 0.2s",
+      boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+      textShadow: "0 2px 4px rgba(0,0,0,0.5)",
+    });
+    document.body.appendChild(t);
+  }
+  t.textContent = text;
+  t.style.background = color || "rgba(0,0,0,0.9)";
+  t.style.opacity = "1";
+  t.style.transform = "translateX(-50%) scale(1.1)";
+  clearTimeout(t._timer);
+  setTimeout(() => { t.style.transform = "translateX(-50%) scale(1)"; }, 100);
+  t._timer = setTimeout(() => { t.style.opacity = "0"; }, 2000);
+}
+
+function onFeedbackKey(e) {
+  if (e.key === "," || e.code === "Comma") {
+    adjustThresh(+THRESH_STEP, "− SKIP LESS");
+    e.preventDefault(); e.stopPropagation();
+  }
+  else if (e.key === "." || e.code === "Period") {
+    adjustThresh(-THRESH_STEP, "+ SKIP MORE");
+    e.preventDefault(); e.stopPropagation();
+  }
+}
+document.addEventListener("keydown", onFeedbackKey, true);
+window.addEventListener("keydown", onFeedbackKey, true);
+
+// ── Boot ────────────────────────────────────────────────────────────────────
+console.log(`[Shorts] extension loaded — threshold ${BOREDOM_THRESH}`);
+ensureDashboard();
+connectWS();

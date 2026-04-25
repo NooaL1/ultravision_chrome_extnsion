@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+python/simple_gaze_receiver/registered_faces/
+extension/face-api.min.js
+extension/models/

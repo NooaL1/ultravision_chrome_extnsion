@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Gaze Attractiveness Meter",
+  "version": "0.1",
+  "description": "Detects faces on web pages and rates them based on your eye behaviour.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["models/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

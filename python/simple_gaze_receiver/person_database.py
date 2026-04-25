@@ -128,7 +128,7 @@ class _LBPHBackend:
     The confidence value is printed each trigger so you can tune it.
     """
 
-    def __init__(self, confidence_threshold: float = 200.0):  # raised – tune down once confidence is known
+    def __init__(self, confidence_threshold: float = 100.0):  # lower = stricter match; >=Unknown
         self._threshold  = confidence_threshold
         # Finer grid and more neighbours → more discriminative histogram
         self._recognizer = cv2.face.LBPHFaceRecognizer_create(
@@ -140,12 +140,20 @@ class _LBPHBackend:
         self._trained      = False
 
     def add_person(self, name: str, age: int, role: str, bgr_img: np.ndarray) -> bool:
-        label     = len(self._meta)
-        augmented = _augment(bgr_img)
+        return self.add_person_multi(name, age, role, [bgr_img])
+
+    def add_person_multi(self, name: str, age: int, role: str,
+                         bgr_imgs: list) -> bool:
+        if not bgr_imgs:
+            return False
+        label = len(self._meta)
+        all_aug = []
+        for img in bgr_imgs:
+            all_aug.extend(_augment(img))
 
         self._meta.append({"name": name, "age": age, "role": role})
-        self._train_images.extend(augmented)
-        self._train_labels.extend([label] * len(augmented))
+        self._train_images.extend(all_aug)
+        self._train_labels.extend([label] * len(all_aug))
 
         self._recognizer.train(
             self._train_images, np.array(self._train_labels)
@@ -153,7 +161,7 @@ class _LBPHBackend:
         self._trained = True
         print(
             f"[PersonDB] Registered '{name}' ({role}, {age}y) via OpenCV LBPH "
-            f"({len(augmented)} augmented samples)."
+            f"({len(bgr_imgs)} captures × augmentation = {len(all_aug)} samples)."
         )
         return True
 

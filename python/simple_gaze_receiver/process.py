@@ -7,9 +7,13 @@ import threading
 import urllib.parse
 import urllib.request
 import json
+import base64
 
 from ultralytics import YOLO
 from person_database import PersonDatabase
+from speech import SpeechEngine
+from listen import Listener
+from profiles import ProfileStore
 
 VGA_W, VGA_H = 640, 480
 
@@ -21,6 +25,21 @@ DWELL_SECONDS  = 1.5   # seconds gaze must dwell before trigger
 DWELL_RADIUS   = 60    # pixel radius gaze must stay within
 
 PUPIL_CHANGE_THRESHOLD = 0.08   # 8% pupil diameter change triggers search
+
+# ── Ollama text model (description generator for detected objects) ───────────
+OLLAMA_URL          = "http://localhost:11434/api/generate"
+OLLAMA_MODEL        = "gemma3:1b"
+OLLAMA_VISION_MODEL = "moondream"   # used only on R/T hotkey, not per-dwell
+OLLAMA_TIMEOUT      = 10   # seconds
+OLLAMA_VISION_TIMEOUT = 20
+
+# Crop radius (px) around gaze for OCR / vision hotkeys
+VISION_CROP_RADIUS = 180
+
+# ── Text-to-speech config ─────────────────────────────────────────────────────
+TTS_ENABLED      = True
+TTS_RATE         = 180   # words per minute
+TTS_DEDUP_WINDOW = 5.0   # seconds before same phrase can repeat
 
 # ── Cognitive Load Tracker config ─────────────────────────────────────────────
 CLT_WINDOW_SEC       = 30.0    # rolling window length (seconds)
@@ -133,6 +152,119 @@ def _search_product(query: str) -> dict:
     return {"price": "Price N/A"}
 
 
+# ── Ollama text query ─────────────────────────────────────────────────────────
+
+def _query_ollama_text(class_name: str) -> str | None:
+    """Ask Ollama text model for a short, fun fact about the detected object."""
+    try:
+        prompt = (
+            f"Tell me one surprising, weird, or funny fact about a "
+            f"'{class_name}' in one short sentence (max 15 words). "
+            f"Be playful, not corporate. No preamble, just the fact."
+        )
+        payload = json.dumps({
+            "model":  OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        text = (data.get("response") or "").strip()
+        text = text.strip(" .\n\"'")
+        return text or None
+    except Exception as exc:
+        print(f"[Ollama] text query failed: {exc}")
+        return None
+
+
+def _query_moondream(image_bgr, prompt: str) -> str | None:
+    """Send a BGR image crop to moondream vision model with a custom prompt."""
+    try:
+        ok, buf = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return None
+        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        payload = json.dumps({
+            "model":  OLLAMA_VISION_MODEL,
+            "prompt": prompt,
+            "images": [b64],
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=OLLAMA_VISION_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        text = (data.get("response") or "").strip()
+        return text or None
+    except Exception as exc:
+        print(f"[Moondream] query failed: {exc}")
+        return None
+
+
+def _generate_personalized_greeting(profile: dict, time_since: str) -> str | None:
+    """Use Ollama to craft a personalised greeting based on profile + history."""
+    try:
+        facts = "; ".join(profile.get("facts", [])) or "no notes"
+        meetings = profile.get("meeting_count", 1)
+        prompt = (
+            f"Greet a person named {profile['name']} in ONE short, warm, "
+            f"playful sentence. Facts about them: {facts}. "
+            f"You last saw them {time_since}. This is meeting #{meetings}. "
+            f"Be natural and personal, like an old friend. "
+            f"No preamble, no quotes, just the greeting (max 18 words)."
+        )
+        payload = json.dumps({
+            "model":  OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        text = (data.get("response") or "").strip().strip('"\'')
+        return text or None
+    except Exception as exc:
+        print(f"[Greet] generation failed: {exc}")
+        return None
+
+
+def _translate_to_finnish(text: str) -> str | None:
+    """Translate English text to Finnish using the text model."""
+    try:
+        prompt = (
+            f"Translate this English text to Finnish. Reply only with the "
+            f"Finnish translation, no preamble:\n\n{text}"
+        )
+        payload = json.dumps({
+            "model":  OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        return (data.get("response") or "").strip() or None
+    except Exception as exc:
+        print(f"[Translate] failed: {exc}")
+        return None
+
+
 # ── OpenCV face detector (Haar – no extra deps) ───────────────────────────────
 
 def _make_face_detector():
@@ -142,6 +274,18 @@ def _make_face_detector():
         print("[FaceDetect] WARNING: Haar cascade not found – face detection disabled.")
         return None
     return detector
+
+
+def _make_eye_detector():
+    path = cv2.data.haarcascades + "haarcascade_eye.xml"
+    det = cv2.CascadeClassifier(path)
+    return det if not det.empty() else None
+
+
+def _make_profile_detector():
+    path = cv2.data.haarcascades + "haarcascade_profileface.xml"
+    det = cv2.CascadeClassifier(path)
+    return det if not det.empty() else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,11 +300,9 @@ def _make_face_detector():
 #        "photo_path": "photos/alice.jpg"},
 #
 PEOPLE_REGISTRY: list[dict] = [
-
-    {"name": "Faisal", "age": 22, "role": "Student",
-         "photo_path": r"C:\\Users\\Pavel\\Pictures\\faisal.jpg"},
-    {"name": "Sai Kiran", "age": 28, "role": "Engineer", 
-            "photo_path": r"C:\\Users\\Pavel\\Pictures\\saikiran.jpg"},
+    # Add entries here, e.g.:
+    # {"name": "Faisal", "age": 22, "role": "Student",
+    #      "photo_path": r"C:\Users\super\Pictures\faisal.jpg"},
     # ← ADD YOUR ENTRIES HERE ↓
     # {"name": "Alice Smith",   "age": 29, "role": "Engineer",    "photo_path": "photos/alice.jpg"},
     # {"name": "Bob Johnson",   "age": 45, "role": "Businessman", "photo_path": "photos/bob.jpg"},
@@ -365,43 +507,77 @@ class process:
          # ── Cognitive load tracker (read-only observer) ───────────────────────
         self.cog_tracker = CognitiveLoadTracker()
 
+        # ── Text-to-speech engine ─────────────────────────────────────────────
+        self.speech = (SpeechEngine(rate=TTS_RATE, dedup_window=TTS_DEDUP_WINDOW)
+                       if TTS_ENABLED else None)
+
+        # ── Voice input (microphone) ──────────────────────────────────────────
+        self.listener = Listener(language="en-US")
+
+        # ── Per-person profiles (meetings, facts, history) ────────────────────
+        self.profiles = ProfileStore()
+        self._greeted_recently: dict[str, float] = {}  # name -> last greet ts
+
+        # Cooldown so we don't ask the same unknown face every dwell
+        self._last_unknown_ask = 0.0
+        self._asking_name      = False
+        self._listening        = False   # True while microphone is recording
+
+        # Continuous face tracking state
+        self._face_check_every  = 2         # run detector every N frames (faster)
+        self._frame_counter     = 0
+        self._unknown_seen_at   = None      # timestamp first Unknown seen
+        self._last_known_face   = None      # last identified profile dict
+        self._UNKNOWN_REGISTER_AFTER = 1.0  # seconds of unknown → ask name
+
+        # Cached face box for lightweight overlay (no name/age/role text)
+        self._current_face_box = None
+        self._current_face_box_until = 0.0
+
+        # ── Attractiveness meter (pupil dilation while looking at a face) ─────
+        self._attr_baseline_buf = collections.deque(maxlen=80)  # ~last 10 s pupils
+        self._attr_face_started = None    # when current "looking at face" began
+        self._attr_baseline     = None    # pupil baseline frozen at face onset
+        self._attr_during_buf   = []      # pupil samples while looking at face
+        self._attr_cooldown_to  = 0.0     # don't re-score until this timestamp
+        self._attr_last_score   = None    # latest score for overlay (text, score)
+        self._attr_score_shown_until = 0.0
+        self._ATTR_MEASURE_SECONDS = 2.0
+        self._ATTR_COOLDOWN        = 15.0
+
         # ── Person database ───────────────────────────────────────────────────
         print("Loading person database…")
         self.person_db     = PersonDatabase()
-        self.face_detector = _make_face_detector()
+        self.face_detector    = _make_face_detector()
+        self.eye_detector     = _make_eye_detector()
+        self.profile_detector = _make_profile_detector()
 
         if PEOPLE_REGISTRY:
             self.person_db.register_many(PEOPLE_REGISTRY)
+
+        # Auto-load any saved faces — group <name>.jpg + <name>_2.jpg etc.
+        import os, glob, re
+        if os.path.isdir("registered_faces"):
+            grouped: dict[str, list] = {}
+            for path in sorted(glob.glob("registered_faces/*.jpg")):
+                base = os.path.splitext(os.path.basename(path))[0]
+                # Strip "_N" suffix to group multi-captures under one name
+                root = re.sub(r"_\d+$", "", base)
+                img = cv2.imread(path)
+                if img is not None:
+                    grouped.setdefault(root, []).append(img)
+            for name, imgs in grouped.items():
+                self.person_db._backend.add_person_multi(name, 0, "Friend", imgs)
+                self.person_db._count += 1
+                print(f"[Autoload] Restored '{name}' ({len(imgs)} image(s))")
+
+        if self.person_db.size:
             print(f"Person database ready: {self.person_db.size} person(s) registered.")
         else:
-            print("Person database is empty – add entries to PEOPLE_REGISTRY in process.py.")
+            print("Person database empty – press N while looking at a face to add one.")
 
-        # ── YOLO gadget model ─────────────────────────────────────────────────
-        print("Loading Open-Vocabulary YOLO model…")
-        self.yolo = YOLO("yolov8s-world.pt")
-
-        custom_classes = [
-            "iPhone", "Samsung Galaxy phone", "Google Pixel phone", "foldable smartphone",
-            "iPad Pro", "iPad mini", "Android tablet", "Kindle e-reader", "Microsoft Surface tablet",
-            "MacBook laptop", "Dell XPS laptop", "ThinkPad laptop", "gaming laptop", "Chromebook",
-            "computer monitor", "curved monitor", "desktop computer tower", "iMac desktop", "Mac mini",
-            "computer mouse", "trackball mouse", "mechanical keyboard", "Apple Magic Keyboard",
-            "laptop trackpad", "webcam", "drawing tablet", "stylus pen", "Apple Pencil", "stream deck",
-            "AirPods earbuds", "wireless earbuds", "over-ear headphones", "gaming headset",
-            "Bluetooth speaker", "studio monitor speaker", "podcast microphone", "lavalier microphone",
-            "digital camera", "DSLR camera", "mirrorless camera", "GoPro action camera", "camera lens", "ring light",
-            "Apple Watch", "Garmin smartwatch", "fitness tracker", "VR headset", "Meta Quest",
-            "PlayStation controller", "Xbox controller", "Nintendo Switch", "Steam Deck console", "gaming console",
-            "wifi router", "network switch", "NAS server", "USB flash drive", "external hard drive",
-            "portable SSD", "USB-C hub", "SD card", "SD card reader",
-            "smart speaker", "Amazon Echo", "Google Nest Hub", "smart thermostat", "smart bulb",
-            "security camera", "video doorbell", "power bank", "wireless charging pad", "MagSafe charger",
-            "laptop power brick", "power strip", "surge protector", "USB-C cable", "HDMI cable",
-            "Raspberry Pi", "Arduino board", "soldering iron", "multimeter", "3D printer",
-            "drone", "calculator", "laser pointer", "vr controllers",
-        ]
-        self.yolo.set_classes(custom_classes)
-        print(f"YOLO-World model loaded with {len(custom_classes)} custom gadget classes.")
+        # YOLO object detection removed — face-only mode.
+        self.yolo = None
 
     # ── Gaze helpers ─────────────────────────────────────────────────────────
 
@@ -424,36 +600,60 @@ class process:
 
     def _find_face_near_gaze(self, frame: "np.ndarray", gaze_x: int, gaze_y: int):
         """
-        Run Haar face detection and return the face closest to the gaze point.
-        Uses stricter settings to avoid partial-face false detections.
-        Returns (x1, y1, x2, y2) bounding box, or None.
+        Robust face detection — tries frontal + profile + flipped profile,
+        validates with eyes when possible but accepts large frontal faces
+        even without eye confirmation. Returns face closest to gaze.
         """
         if self.face_detector is None:
             return None
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # CLAHE equalization helps Haar work better in varied lighting
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray  = clahe.apply(gray)
+        gray_eq = clahe.apply(gray)
 
-        faces = self.face_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=8,        # higher = fewer false partial-face detections
-            minSize=(80, 80),      # ignore tiny detections (partial features)
-            flags=cv2.CASCADE_SCALE_IMAGE,
-        )
-        if len(faces) == 0:
+        all_faces = []
+
+        # Frontal — relaxed
+        for (fx, fy, fw, fh) in self.face_detector.detectMultiScale(
+                gray_eq, scaleFactor=1.1, minNeighbors=4,
+                minSize=(40, 40), flags=cv2.CASCADE_SCALE_IMAGE):
+            all_faces.append((fx, fy, fw, fh, "frontal"))
+
+        # Profile (right-facing)
+        if self.profile_detector is not None:
+            for (fx, fy, fw, fh) in self.profile_detector.detectMultiScale(
+                    gray_eq, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)):
+                all_faces.append((fx, fy, fw, fh, "profile"))
+            # Profile (left-facing) by flipping image
+            flipped = cv2.flip(gray_eq, 1)
+            for (fx, fy, fw, fh) in self.profile_detector.detectMultiScale(
+                    flipped, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)):
+                all_faces.append((flipped.shape[1] - fx - fw, fy, fw, fh, "profile_l"))
+
+        if not all_faces:
             return None
 
-        best, best_dist = None, float("inf")
-        for (fx, fy, fw, fh) in faces:
-            cx, cy = fx + fw // 2, fy + fh // 2
-            d = self._dist((gaze_x, gaze_y), (cx, cy))
-            if d < best_dist:
-                best_dist = d
-                best = (fx, fy, fx + fw, fy + fh)
-        return best
+        # Pick face closest to gaze
+        all_faces.sort(key=lambda f: self._dist(
+            (gaze_x, gaze_y), (f[0] + f[2]//2, f[1] + f[3]//2)))
+
+        # For frontal faces large enough, accept directly. For small or profile,
+        # require an eye for confirmation (cuts random patterns/clothes).
+        for fx, fy, fw, fh, kind in all_faces:
+            if kind == "frontal" and fw >= 70:
+                return (fx, fy, fx + fw, fy + fh)
+            if self.eye_detector is not None:
+                roi = gray_eq[fy:fy + fh//2 + 5, fx:fx + fw]
+                if roi.size > 0:
+                    eyes = self.eye_detector.detectMultiScale(
+                        roi, scaleFactor=1.1, minNeighbors=3,
+                        minSize=(max(6, fw//14), max(6, fh//18)),
+                    )
+                    if len(eyes) >= 1:
+                        return (fx, fy, fx + fw, fy + fh)
+            else:
+                return (fx, fy, fx + fw, fy + fh)
+        return None
 
     def _identify_person(self, frame: "np.ndarray", box) -> dict | None:
         """
@@ -474,6 +674,358 @@ class process:
         y2c = min(fh, y2 + pad_y)
         face_crop = frame[y1c:y2c, x1c:x2c]
         return self.person_db.identify(face_crop)
+
+    # ── Hotkey vision actions (R = read text, T = translate) ─────────────────
+
+    def _crop_gaze_region(self, frame, gaze_x: int, gaze_y: int):
+        fh, fw = frame.shape[:2]
+        r = VISION_CROP_RADIUS
+        x1 = max(0, gaze_x - r); y1 = max(0, gaze_y - r)
+        x2 = min(fw, gaze_x + r); y2 = min(fh, gaze_y + r)
+        if x2 - x1 < 20 or y2 - y1 < 20:
+            return None
+        return frame[y1:y2, x1:x2]
+
+    def _action_read_text(self, gaze_x: int, gaze_y: int):
+        """R-key: OCR the gaze region with moondream and speak it."""
+        def _worker():
+            crop = self._crop_gaze_region(self.image_buffer_scene.copy(),
+                                           gaze_x, gaze_y)
+            if crop is None:
+                return
+            if self.speech: self.speech.speak("Reading.")
+            text = _query_moondream(
+                crop,
+                "Read aloud any text visible in this image. "
+                "Reply with only the text, nothing else. "
+                "If no text is visible, reply 'No text found'."
+            )
+            if text:
+                print(f"[Read] {text}")
+                if self.speech: self.speech.speak(text)
+            else:
+                if self.speech: self.speech.speak("Could not read.")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_translate(self, gaze_x: int, gaze_y: int):
+        """T-key: OCR + translate to Finnish, then speak."""
+        def _worker():
+            crop = self._crop_gaze_region(self.image_buffer_scene.copy(),
+                                           gaze_x, gaze_y)
+            if crop is None:
+                return
+            if self.speech: self.speech.speak("Translating.")
+            text = _query_moondream(
+                crop,
+                "Read aloud any text visible in this image. "
+                "Reply with only the text, nothing else."
+            )
+            if not text or "no text" in text.lower():
+                if self.speech: self.speech.speak("No text found.")
+                return
+            print(f"[Translate] EN: {text}")
+            fi = _translate_to_finnish(text)
+            if fi:
+                print(f"[Translate] FI: {fi}")
+                if self.speech: self.speech.speak(fi)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _score_attractiveness(self, pupil_ratio: float, fixation_pct: float,
+                               blink_count: int) -> int:
+        """
+        Combine three signals into a 1–10 attractiveness score:
+          • pupil_ratio  : how much pupil dilated vs baseline (-0.10 .. +0.20+)
+          • fixation_pct : fraction of measurement window where gaze was on face
+          • blink_count  : number of blinks during the window (lower = more focused)
+        """
+        # Pupil component (0–100)
+        if pupil_ratio < -0.05:    pupil_s = 0
+        elif pupil_ratio < 0:      pupil_s = 30 + pupil_ratio * 600    # -0.05..0 → 0..30
+        elif pupil_ratio < 0.20:   pupil_s = 30 + pupil_ratio * 350    # 0..0.20 → 30..100
+        else:                      pupil_s = 100
+
+        # Fixation component (0–100): >=80% time on face = full score
+        fix_s = max(0, min(100, fixation_pct * 125))
+
+        # Blink suppression component (0–100): 0 blinks=100, 1=70, 2=40, 3+=20
+        blink_s = {0: 100, 1: 70, 2: 40}.get(blink_count, 20)
+
+        # Weighted blend: pupil 55%, fixation 30%, blinks 15%
+        composite = pupil_s * 0.55 + fix_s * 0.30 + blink_s * 0.15
+
+        # Map composite (0–100) → 1–10 (ensure range)
+        score = int(round(composite / 10))
+        return max(1, min(10, score))
+
+    def _attractiveness_comment(self, score: int) -> str:
+        """Generate a cheeky one-liner via Ollama based on score."""
+        try:
+            prompt = (
+                f"You are a flirty wingman AI judging someone's attractiveness "
+                f"on a 1-to-10 scale based on the user's pupil dilation while "
+                f"they look at a person. The score is {score} out of 10. "
+                f"Reply with ONE short, playful, cheeky sentence (max 18 words) "
+                f"announcing the score. No preamble, no quotes."
+            )
+            payload = json.dumps({
+                "model":  OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                OLLAMA_URL, data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode())
+            return (data.get("response") or "").strip().strip('"\'') \
+                   or f"I'd say a {score} out of 10."
+        except Exception as exc:
+            print(f"[Attr] comment failed: {exc}")
+            return f"That's a {score} out of 10."
+
+    def _attr_announce(self, score: int):
+        def _worker():
+            line = self._attractiveness_comment(score)
+            print(f"[Attr] score={score}/10  → {line}")
+            self._attr_last_score = (line, score)
+            self._attr_score_shown_until = time.time() + 8.0
+            if self.speech: self.speech.speak(line)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_attractiveness(self, now: float, current_pupil: float,
+                               face_detected: bool):
+        """Score pupil + fixation + blink signals while looking at face."""
+        if current_pupil > 0:
+            self._attr_baseline_buf.append(current_pupil)
+
+        if face_detected:
+            if self._attr_face_started is None:
+                if len(self._attr_baseline_buf) >= 10 and now > self._attr_cooldown_to:
+                    self._attr_baseline = sum(self._attr_baseline_buf) / \
+                                           len(self._attr_baseline_buf)
+                    self._attr_face_started = now
+                    self._attr_during_buf   = []
+                    self._attr_face_frames  = 0      # frames where face is under gaze
+                    self._attr_total_frames = 0      # total frames in window
+                    self._attr_blinks       = 0
+                    self._attr_last_event   = self.current_event
+                    print(f"[Attr] start — baseline pupil {self._attr_baseline:.2f}")
+            # Sample
+            if current_pupil > 0:
+                self._attr_during_buf.append(current_pupil)
+            self._attr_face_frames  += 1
+            self._attr_total_frames += 1
+            # Count blink transitions
+            if self.current_event == "BB" and self._attr_last_event != "BB":
+                self._attr_blinks += 1
+            self._attr_last_event = self.current_event
+        else:
+            if self._attr_face_started is not None:
+                self._attr_total_frames += 1   # gaze drifted off — count for fixation%
+                if self.current_event == "BB" and self._attr_last_event != "BB":
+                    self._attr_blinks += 1
+                self._attr_last_event = self.current_event
+
+        # Time to score?
+        if self._attr_face_started is not None \
+                and now - self._attr_face_started >= self._ATTR_MEASURE_SECONDS \
+                and len(self._attr_during_buf) >= 5:
+            avg   = sum(self._attr_during_buf) / len(self._attr_during_buf)
+            ratio = (avg - self._attr_baseline) / self._attr_baseline \
+                    if self._attr_baseline else 0.0
+            fix_pct = (self._attr_face_frames / self._attr_total_frames
+                       if self._attr_total_frames else 0.0)
+            score = self._score_attractiveness(ratio, fix_pct, self._attr_blinks)
+            print(f"[Attr] pupil {ratio*100:+.1f}%  fixation {fix_pct*100:.0f}%"
+                  f"  blinks {self._attr_blinks}  → {score}/10")
+            self._attr_announce(score)
+            self._attr_cooldown_to  = now + self._ATTR_COOLDOWN
+            self._attr_face_started = None
+            self._attr_during_buf   = []
+
+    def _greet_person_async(self, name: str):
+        """Generate a personalised greeting via Ollama and speak it."""
+        # Don't spam — at most one greeting per person per 60 s
+        last = self._greeted_recently.get(name, 0)
+        if time.time() - last < 60.0:
+            return
+        self._greeted_recently[name] = time.time()
+
+        def _worker():
+            profile = self.profiles.record_meeting(name)
+            if profile is None:
+                # No profile yet (legacy face) — create one on first sighting
+                self.profiles.add(name)
+                profile = self.profiles.get(name)
+            time_since = "just now" if profile["meeting_count"] == 1 else \
+                         self.profiles.time_since(profile)
+            print(f"[Greet] {name} — meeting #{profile['meeting_count']}, "
+                  f"facts: {profile.get('facts', [])}")
+            greeting = _generate_personalized_greeting(profile, time_since)
+            if greeting:
+                print(f"[Greet] → {greeting}")
+                if self.speech: self.speech.speak(greeting)
+            else:
+                if self.speech: self.speech.speak(f"Hey {name}!")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_remember_face(self, gaze_x: int, gaze_y: int):
+        """Auto: ask name (voice), capture face, register."""
+        if self._asking_name:
+            return
+        def _worker():
+            import os
+            self._asking_name = True
+            try:
+                snap = self.image_buffer_scene.copy()
+                face_box = self._find_face_near_gaze(snap, gaze_x, gaze_y)
+                if face_box is None:
+                    print("[Remember] No face found near gaze.")
+                    return
+
+                def _crop(frame, box):
+                    x1, y1, x2, y2 = box
+                    pad_x = int((x2 - x1) * 0.4)
+                    pad_y = int((y2 - y1) * 0.4)
+                    fh, fw = frame.shape[:2]
+                    return frame[max(0, y1-pad_y):min(fh, y2+pad_y),
+                                 max(0, x1-pad_x):min(fw, x2+pad_x)]
+
+                crops = [_crop(snap, face_box)]
+                print(f"[Remember] Capture 1/6 ({crops[0].shape})")
+                if self.speech: self.speech.speak("Hold still for a second.")
+                # Capture 5 more frames over ~3 seconds — different angles/blinks
+                for i in range(5):
+                    time.sleep(0.6)
+                    f = self.image_buffer_scene.copy()
+                    box = self._find_face_near_gaze(f, gaze_x, gaze_y)
+                    if box is not None:
+                        crops.append(_crop(f, box))
+                        print(f"[Remember] Capture {len(crops)}/6")
+                print(f"[Remember] Got {len(crops)} face captures total.")
+
+                if self.speech:
+                    self.speech.speak("Hi there! What is your name?")
+                time.sleep(3.0)  # let TTS finish before we start mic
+
+                name = None
+                if self.listener and self.listener._enabled:
+                    for attempt in (1, 2, 3):
+                        print(f"[Remember] Listening attempt {attempt}/3 (8s)…")
+                        self._listening = True
+                        try:
+                            heard = self.listener.listen_once(timeout=8.0,
+                                                              phrase_limit=5.0)
+                        finally:
+                            self._listening = False
+                        if heard:
+                            name = heard
+                            break
+                        if attempt < 3 and self.speech:
+                            self.speech.speak("I didn't hear you. Please say your name.")
+                            time.sleep(2.5)
+                else:
+                    print("[Remember] Listener not enabled — skipping registration.")
+                    return
+
+                if not name:
+                    print("[Remember] Gave up after 3 attempts.")
+                    if self.speech:
+                        self.speech.speak("I couldn't hear you. Maybe next time.")
+                    return
+
+                # Clean up name: take first 1-2 words, strip filler words
+                stop = {"my", "name", "is", "i", "am", "i'm", "the", "a", "this"}
+                words = [w for w in name.split() if w.lower() not in stop]
+                if not words:
+                    words = name.split()
+                name = " ".join(words[:2]).title()
+                print(f"[Remember] Parsed name: '{name}'")
+
+                # Confirm by speaking it back
+                if self.speech:
+                    self.speech.speak(f"Nice to meet you, {name}!")
+                time.sleep(2.0)
+
+                # Ask one fun fact about them
+                fact = ""
+                if self.speech:
+                    self.speech.speak("Tell me one thing about yourself.")
+                time.sleep(2.5)
+                if self.listener and self.listener._enabled:
+                    print("[Remember] Listening for a fact (10s)…")
+                    self._listening = True
+                    try:
+                        fact = self.listener.listen_once(timeout=10.0,
+                                                         phrase_limit=8.0) or ""
+                    finally:
+                        self._listening = False
+                    print(f"[Remember] Fact heard: '{fact}'")
+
+                os.makedirs("registered_faces", exist_ok=True)
+                safe = "".join(c for c in name if c.isalnum() or c in "-_ ").strip()
+                # Save the best (first) crop as the main photo
+                path = os.path.join("registered_faces", f"{safe}.jpg")
+                cv2.imwrite(path, crops[0])
+                # Save additional captures with suffix
+                for i, c in enumerate(crops[1:], start=2):
+                    cv2.imwrite(
+                        os.path.join("registered_faces", f"{safe}_{i}.jpg"), c
+                    )
+                print(f"[Remember] Saved {len(crops)} face image(s) → {path}*")
+
+                ok = self.person_db._backend.add_person_multi(
+                    name, 0, "Friend", crops
+                )
+                if ok:
+                    self.person_db._count += 1
+                    self.profiles.add(name, fact)
+                    print(f"[Remember] ✓ Registered '{name}'. Total: {self.person_db.size}")
+                    if self.speech:
+                        if fact:
+                            self.speech.speak(f"Got it. I'll remember that.")
+                        else:
+                            self.speech.speak("Okay, I'll remember you.")
+                else:
+                    print(f"[Remember] ✗ Backend failed to register '{name}'.")
+                    if self.speech:
+                        self.speech.speak("Sorry, I couldn't remember that face.")
+            finally:
+                self._asking_name = False
+                self._last_unknown_ask = time.time()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_describe_scene(self, gaze_x: int, gaze_y: int):
+        """D-key: ask moondream to describe what user is looking at."""
+        def _worker():
+            crop = self._crop_gaze_region(self.image_buffer_scene.copy(),
+                                           gaze_x, gaze_y)
+            if crop is None:
+                return
+            if self.speech: self.speech.speak("Looking.")
+            text = _query_moondream(
+                crop,
+                "Describe what you see in one short, vivid sentence. "
+                "Be playful and observant, like a curious friend."
+            )
+            if text:
+                print(f"[Describe] {text}")
+                if self.speech: self.speech.speak(text)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Ollama description fetch (background) ────────────────────────────────
+
+    def _fetch_description_async(self, highlight: dict):
+        def _worker():
+            desc = _query_ollama_text(highlight["class_name"])
+            if desc:
+                with self._lock:
+                    highlight["description"] = desc
+                print(f"[Ollama] '{highlight['class_name']}' → {desc}")
+                if self.speech:
+                    self.speech.speak(desc)
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── YOLO gadget detection ────────────────────────────────────────────────
 
@@ -718,23 +1270,41 @@ class process:
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, lw)
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        fs1, fs2 = 0.58, 0.48
+        fs1, fs2 = 0.58, 0.42
         thick = 1
 
-        line1 = h["label"]
+        lines = [h["label"]]
         if h["link_status"] == "searching":
-            line2 = "fetching price…"
-        elif h["link_status"] == "ignored":
-            line2 = ""
-        else:
-            line2 = h.get("product_price", "")
+            lines.append("fetching price…")
+        elif h["link_status"] != "ignored":
+            price = h.get("product_price", "")
+            if price:
+                lines.append(price)
 
-        (w1, h1), bl1 = cv2.getTextSize(line1, font, fs1, thick)
-        (w2, h2), bl2 = cv2.getTextSize(line2, font, fs2, thick) if line2 else ((0,0), 0)
+        # Wrap description (Ollama text model output) to ~32 chars per line
+        desc = h.get("description")
+        if desc:
+            words, cur = desc.split(), ""
+            for w in words:
+                if len(cur) + len(w) + 1 > 32:
+                    if cur: lines.append(cur)
+                    cur = w
+                else:
+                    cur = (cur + " " + w) if cur else w
+            if cur: lines.append(cur)
+        elif h["link_status"] != "ignored":
+            lines.append("…")  # placeholder while Ollama is thinking
+
+        # Measure all lines
+        sizes = []
+        for i, ln in enumerate(lines):
+            fs = fs1 if i == 0 else fs2
+            (w, hh), bl = cv2.getTextSize(ln, font, fs, thick)
+            sizes.append((w, hh, bl, fs))
 
         pad     = 5
-        badge_w = max(w1, w2) + pad * 2
-        badge_h = h1 + (h2 if line2 else 0) + bl1 + (bl2 if line2 else 0) + pad * (3 if line2 else 2)
+        badge_w = max(w for w, _, _, _ in sizes) + pad * 2
+        badge_h = sum(hh + bl for _, hh, bl, _ in sizes) + pad * (len(lines) + 1)
 
         by2 = y1
         by1 = max(0, y1 - badge_h)
@@ -746,11 +1316,13 @@ class process:
         tc     = (0, 0, 0)     if brightness > 160 else (255, 255, 255)
         tc_dim = tuple(max(0, int(c * 0.6)) for c in tc)
 
-        y_pos = by1 + h1 + pad
-        cv2.putText(frame, line1, (x1+pad, y_pos), font, fs1, tc, thick, cv2.LINE_AA)
-        if line2:
-            y_pos += h2 + bl1 + pad
-            cv2.putText(frame, line2, (x1+pad, y_pos), font, fs2, tc_dim, thick, cv2.LINE_AA)
+        y_pos = by1 + pad
+        for i, (ln, (_, hh, bl, fs)) in enumerate(zip(lines, sizes)):
+            y_pos += hh
+            col = tc if i == 0 else tc_dim
+            cv2.putText(frame, ln, (x1+pad, y_pos), font, fs, col, thick, cv2.LINE_AA)
+            y_pos += bl + pad
+
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -780,81 +1352,24 @@ class process:
             # ── Cognitive load update (read-only, won't touch eyeEvent) ───────
             self.cog_tracker.update(current_pupil, self.current_event, now)
 
-            # ── Dwell + pupil trigger ─────────────────────────────────────────
-            if GazeX == 0 and GazeY == 0:
-                self.dwell_anchor     = None
-                self.dwell_start_time = None
-                self.baseline_pupil   = None
-            else:
-                if self.dwell_anchor is None:
-                    self.dwell_anchor     = (GazeX, GazeY)
-                    self.dwell_start_time = now
-                    self.baseline_pupil   = current_pupil
-                elif self._dist((GazeX, GazeY), self.dwell_anchor) > DWELL_RADIUS:
-                    self.dwell_anchor     = (GazeX, GazeY)
-                    self.dwell_start_time = now
-                    self.baseline_pupil   = current_pupil
-                elif now - self.dwell_start_time >= DWELL_SECONDS:
-                    pupil_change_ratio = 0.0
-                    if self.baseline_pupil and self.baseline_pupil > 0:
-                        pupil_change_ratio = abs(
-                            current_pupil - self.baseline_pupil
-                        ) / self.baseline_pupil
+            # ── Continuous face detection — only for attractiveness scoring ──
+            self._frame_counter += 1
+            face_under_gaze = False
+            if self._frame_counter % self._face_check_every == 0:
+                snap = self.image_buffer_scene.copy()
+                face_box = self._find_face_near_gaze(snap, GazeX, GazeY)
+                if face_box is not None:
+                    fx = (face_box[0] + face_box[2]) // 2
+                    fy = (face_box[1] + face_box[3]) // 2
+                    if self._dist((GazeX, GazeY), (fx, fy)) < 120:
+                        face_under_gaze = True
+                    self._current_face_box = face_box
+                    self._current_face_box_until = now + 0.5
+                else:
+                    pass
 
-                    # ── Two-tier trigger ──────────────────────────────────────
-                    # PERSON:  dwell alone is enough (no pupil change needed)
-                    # GADGET:  requires dwell + pupil change (original behaviour)
-                    #
-                    # We always run face detection on dwell.
-                    # We only run YOLO + price search when pupil also changed.
-                    snap = self.image_buffer_scene.copy()
-
-                    # Always attempt face detection on dwell
-                    face_highlight = self._run_face_only(snap, GazeX, GazeY)
-
-                    # Only attempt gadget detection if pupil changed enough
-                    gadget_highlight = None
-                    if pupil_change_ratio >= PUPIL_CHANGE_THRESHOLD:
-                        gadget_highlight = self._run_yolo(snap, GazeX, GazeY)
-
-                    # Pick best result: face wins if closer to gaze, else gadget
-                    highlight = None
-                    if face_highlight and gadget_highlight:
-                        def _cd(h):
-                            x1,y1,x2,y2 = h["box"]
-                            return self._dist((GazeX,GazeY),((x1+x2)//2,(y1+y2)//2))
-                        highlight = face_highlight if _cd(face_highlight) <= _cd(gadget_highlight) else gadget_highlight
-                    elif face_highlight:
-                        highlight = face_highlight
-                    elif gadget_highlight:
-                        highlight = gadget_highlight
-
-                    if highlight:
-                            hcx = (highlight["box"][0]+highlight["box"][2])//2
-                            hcy = (highlight["box"][1]+highlight["box"][3])//2
-
-                            # Start price fetch only for searchable gadgets
-                            if (highlight.get("kind") == "gadget" and
-                                    highlight["class_name"] not in IGNORE_SEARCH_CLASSES):
-                                self._fetch_link_async(highlight)
-                            else:
-                                highlight["link_status"] = "ignored"
-
-                            with self._lock:
-                                # Remove any nearby existing highlight
-                                self.active_highlights = [
-                                    h for h in self.active_highlights
-                                    if self._dist(
-                                        ((h["box"][0]+h["box"][2])//2,
-                                         (h["box"][1]+h["box"][3])//2),
-                                        (hcx, hcy)
-                                    ) > DWELL_RADIUS
-                                ]
-                                self.active_highlights.append(highlight)
-
-                    self.dwell_anchor     = None
-                    self.dwell_start_time = None
-                    self.baseline_pupil   = None
+            # Attractiveness scoring (every frame)
+            self._update_attractiveness(now, current_pupil, face_under_gaze)
 
             # Expire old highlights
             with self._lock:
@@ -866,8 +1381,11 @@ class process:
             # ── Draw ──────────────────────────────────────────────────────────
             frame = self.image_buffer_scene.copy()
 
-            for h in snapshot:
-                self._draw_highlight(frame, h)
+            # Skip person/highlight overlay entirely — only draw a light face box
+            if self._current_face_box and now < self._current_face_box_until:
+                x1, y1, x2, y2 = self._current_face_box
+                color = (0, 200, 255) if self._attr_face_started else (180, 180, 180)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
 
             r = max(int(current_pupil), 4)
             cv2.circle(frame, (GazeX, GazeY), r, gaze_color, 2)
@@ -875,8 +1393,70 @@ class process:
              # ── Cognitive load indicator ──────────────────────────────────────
             _draw_cognitive_bar(frame, self.cog_tracker)
 
+            # ── Attractiveness measurement HUD ───────────────────────────────
+            if self._attr_face_started is not None:
+                elapsed = now - self._attr_face_started
+                pct = min(1.0, elapsed / self._ATTR_MEASURE_SECONDS)
+                bar_w, bar_h = 220, 14
+                bx, by = 20, frame.shape[0] - 40
+                cv2.rectangle(frame, (bx-2, by-2), (bx+bar_w+2, by+bar_h+2),
+                              (255, 255, 255), 1)
+                cv2.rectangle(frame, (bx, by), (bx + int(bar_w*pct), by+bar_h),
+                              (0, 200, 255), -1)
+                cv2.putText(frame, "MEASURING ATTRACTION…",
+                            (bx, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (0, 200, 255), 2, cv2.LINE_AA)
+
+            # Show last score for a few seconds, BIG, centred-ish
+            if self._attr_last_score and now < self._attr_score_shown_until:
+                line, score = self._attr_last_score
+                color = (0, 255, 0) if score >= 8 else \
+                        (0, 200, 255) if score >= 5 else (0, 80, 255)
+                # Big score number top-centre
+                txt = f"{score}/10"
+                (tw, th), _ = cv2.getTextSize(
+                    txt, cv2.FONT_HERSHEY_SIMPLEX, 2.4, 5)
+                cx = (frame.shape[1] - tw) // 2
+                cv2.putText(frame, txt, (cx, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.4, (0, 0, 0), 8,
+                            cv2.LINE_AA)
+                cv2.putText(frame, txt, (cx, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.4, color, 4,
+                            cv2.LINE_AA)
+                # Comment line below (wrap to ~40 chars)
+                words, lines, cur = line.split(), [], ""
+                for w in words:
+                    if len(cur) + len(w) + 1 > 40:
+                        lines.append(cur); cur = w
+                    else:
+                        cur = (cur + " " + w) if cur else w
+                if cur: lines.append(cur)
+                ly = 110
+                for ln in lines:
+                    (lw, lh), _ = cv2.getTextSize(
+                        ln, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                    lx = (frame.shape[1] - lw) // 2
+                    cv2.putText(frame, ln, (lx, ly),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 4,
+                                cv2.LINE_AA)
+                    cv2.putText(frame, ln, (lx, ly),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2,
+                                cv2.LINE_AA)
+                    ly += lh + 10
+
+            # ── Listening indicator (red pulsing dot + label) ────────────────
+            if self._listening:
+                pulse = 0.5 + 0.5 * abs((now * 2) % 2 - 1)  # 0..1 triangle
+                radius = int(10 + pulse * 6)
+                cv2.circle(frame, (24, 30), radius, (0, 0, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (24, 30), radius, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, "LISTENING…", (44, 38),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 0, 255), 2, cv2.LINE_AA)
+
             cv2.imshow("Video", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 self.shared_data["stop"].value = True
                 print("Q key pressed. Stopping all processes…")
                 break
