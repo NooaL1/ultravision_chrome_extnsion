@@ -20,6 +20,13 @@ const COUNTDOWN_BASELINE_S = 1.0;      // pupil window used for save baseline
 
 let lastUrl       = location.href;
 let shortStart    = 0;
+let lastSkippedByUs = false;   // true if our algorithm fired the skip
+let lastShortMeta   = null;    // {creator, words}
+let lastShortStarted= 0;       // performance time when current short loaded
+let prediction      = null;    // {prob, sampleCount} for current short
+
+// Genre learning model: creator + word frequencies
+let genreModel = JSON.parse(localStorage.getItem("__shorts_genre__") || "{}");
 let pupilSamples  = [];
 let blinkTimes    = [];
 let saccadeTimes  = [];
@@ -49,10 +56,115 @@ function isOnShort() {
   return location.pathname.startsWith("/shorts/");
 }
 
+// ── Genre-learning helpers ──────────────────────────────────────────────────
+function getCurrentShortMeta() {
+  // Title: try active reel first, then og:title
+  let title = "";
+  let creator = "";
+  const active = document.querySelector("ytd-reel-video-renderer[is-active]")
+              || document.querySelector("ytd-reel-video-renderer");
+  if (active) {
+    const t = active.querySelector("yt-formatted-string.title, h2");
+    if (t) title = t.textContent || "";
+    const c = active.querySelector('a[href^="/@"]');
+    if (c) creator = (c.getAttribute("href")||"").match(/@([^/?#]+)/)?.[1] || "";
+  }
+  if (!title) {
+    const og = document.querySelector('meta[property="og:title"]');
+    if (og) title = og.getAttribute("content") || "";
+  }
+  if (!creator) {
+    const a = document.querySelector('a[href^="/@"]');
+    if (a) creator = (a.getAttribute("href")||"").match(/@([^/?#]+)/)?.[1] || "";
+  }
+  // Tokenise title into useful words
+  const stop = new Set(["this","that","with","from","what","when","your","yours",
+                        "they","them","into","just","like","over","very","than",
+                        "shorts","short","video","watch"]);
+  const wordSet = new Set();
+  for (const w of (title.toLowerCase().match(/[a-zÀ-ſ]{4,}/g) || [])) {
+    if (!stop.has(w)) wordSet.add(w);
+  }
+  return { creator, title, words: [...wordSet] };
+}
+
+function recordOutcome(meta, didSkip) {
+  if (!meta || (!meta.creator && meta.words.length === 0)) return;
+  genreModel.creator ||= {};
+  genreModel.words   ||= {};
+  const bump = (bucket, key) => {
+    bucket[key] ||= { watched: 0, skipped: 0 };
+    bucket[key][didSkip ? "skipped" : "watched"]++;
+  };
+  if (meta.creator) bump(genreModel.creator, meta.creator);
+  for (const w of meta.words) bump(genreModel.words, w);
+  localStorage.setItem("__shorts_genre__", JSON.stringify(genreModel));
+  console.log(`[Shorts] recorded ${didSkip?"SKIP":"WATCH"} `
+            + `creator=@${meta.creator} words=[${meta.words.slice(0,5).join(",")}]`);
+}
+
+function predictInterest(meta) {
+  if (!meta) return null;
+  let weightedWatched = 0, totalWeight = 0, totalPriors = 0;
+  const creatorBucket = meta.creator && genreModel.creator?.[meta.creator];
+  if (creatorBucket) {
+    const total = creatorBucket.watched + creatorBucket.skipped;
+    if (total >= 1) {
+      const rate = creatorBucket.watched / total;
+      const weight = total * 3;          // creator counts 3× per word
+      weightedWatched += rate * weight;
+      totalWeight     += weight;
+      totalPriors     += total;
+    }
+  }
+  for (const w of meta.words) {
+    const b = genreModel.words?.[w];
+    if (!b) continue;
+    const total = b.watched + b.skipped;
+    if (total >= 1) {
+      const rate = b.watched / total;
+      weightedWatched += rate * total;
+      totalWeight     += total;
+      totalPriors     += total;
+    }
+  }
+  if (totalPriors < 5 || totalWeight === 0) return null;
+  return { prob: weightedWatched / totalWeight, priors: totalPriors };
+}
+
+// ── Mood classifier ─────────────────────────────────────────────────────────
+function classifyMood(blinkRate, saccRate, cv) {
+  if (blinkRate > 0.5)                       return { name: "TIRED",      color: "#ffa726", icon: "🥱" };
+  if (saccRate  > 2.0)                       return { name: "DISTRACTED", color: "#ef5350", icon: "😵" };
+  if (blinkRate < 0.2 && saccRate < 0.8 && cv > 0.005)
+                                             return { name: "FOCUSED",    color: "#26c6da", icon: "🎯" };
+                                             return { name: "NEUTRAL",    color: "#9e9e9e", icon: "⚖" };
+}
+
 setInterval(() => {
   if (location.href !== lastUrl) {
+    // Finalise the previous Short before reset
+    if (lastShortMeta && lastShortStarted) {
+      const elapsed = performance.now() / 1000 - lastShortStarted;
+      let didSkip = null;
+      if (lastSkippedByUs)        didSkip = true;
+      else if (elapsed < 3.0)     didSkip = true;
+      else if (elapsed > 5.0)     didSkip = false;
+      if (didSkip !== null) recordOutcome(lastShortMeta, didSkip);
+    }
     lastUrl = location.href;
-    if (isOnShort()) resetForNewShort();
+    lastSkippedByUs = false;
+    if (isOnShort()) {
+      resetForNewShort();
+      // Capture meta for this new Short (slight delay so DOM has settled)
+      setTimeout(() => {
+        lastShortMeta    = getCurrentShortMeta();
+        lastShortStarted = performance.now() / 1000;
+        prediction       = predictInterest(lastShortMeta);
+        console.log(`[Shorts] new short meta:`, lastShortMeta,
+                    `prediction:`, prediction);
+      }, 500);
+    }
   }
 }, 250);
 
@@ -207,6 +319,7 @@ function computeBoredom() {
 }
 
 function skipToNext() {
+  lastSkippedByUs = true;
   if (document.activeElement && document.activeElement.blur) {
     document.activeElement.blur();
   }
@@ -268,6 +381,16 @@ function ensureDashboard() {
   d.innerHTML = `
     <div style="font:bold 14px system-ui;margin-bottom:10px;letter-spacing:.5px;">
       🎯 GAZE SIGNALS
+    </div>
+    <div id="__d_mood__" style="text-align:center;font:bold 13px system-ui;
+         margin-bottom:8px;padding:5px 10px;border-radius:8px;
+         background:rgba(255,255,255,0.06);letter-spacing:1px;">
+      ⚖ NEUTRAL
+    </div>
+    <div id="__d_pred__" style="font:11px system-ui;margin-bottom:10px;
+         padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.04);
+         text-align:center;line-height:1.4;">
+      🔮 — <span style="opacity:.5;">need 5+ priors</span>
     </div>
     <div style="position:relative;height:90px;width:90px;margin:0 auto 8px;">
       <svg width="90" height="90" viewBox="0 0 90 90" style="transform:rotate(-90deg);">
@@ -367,6 +490,35 @@ function updateDashboard() {
   }
   const sc = document.getElementById("__d_score__");
   if (sc) sc.textContent = score;
+
+  // Mood chip
+  const mood = classifyMood(sig.blinkRate || 0, sig.saccRate || 0, sig.cv || 0);
+  const moodEl = document.getElementById("__d_mood__");
+  if (moodEl) {
+    moodEl.textContent = `${mood.icon} ${mood.name}`;
+    moodEl.style.background = mood.color + "33";
+    moodEl.style.color      = mood.color;
+    moodEl.style.border     = `1px solid ${mood.color}55`;
+  }
+
+  // Genre prediction
+  const predEl = document.getElementById("__d_pred__");
+  if (predEl) {
+    if (prediction) {
+      const pctSkip = Math.round((1 - prediction.prob) * 100);
+      const willSkip = pctSkip > 60;
+      const willWatch = pctSkip < 40;
+      const color = willSkip ? "#ff4040" : willWatch ? "#00d060" : "#ffd400";
+      const verdict = willSkip ? "will SKIP" : willWatch ? "will WATCH" : "uncertain";
+      predEl.innerHTML =
+        `🔮 PRED  <span style="color:${color};font-weight:bold;">`
+      + `${pctSkip}% ${verdict}</span>  <span style="opacity:.5;">`
+      + `(${prediction.priors} priors)</span>`;
+    } else {
+      predEl.innerHTML =
+        `🔮 — <span style="opacity:.5;">need 5+ priors</span>`;
+    }
+  }
 
   const state = countdown
     ? `⚠ SKIPPING in ${((COUNTDOWN_MS-(Date.now()-countdown.startTs))/1000).toFixed(1)}s`
