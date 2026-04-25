@@ -22,9 +22,16 @@ DWELL_RADIUS   = 60    # pixel radius gaze must stay within
 
 PUPIL_CHANGE_THRESHOLD = 0.08   # 8% pupil diameter change triggers search
 
+# ── Cognitive Load Tracker config ─────────────────────────────────────────────
+CLT_WINDOW_SEC       = 30.0    # rolling window length (seconds)
+CLT_PUPIL_BASELINE_SEC = 10.0  # first N seconds used to learn personal baseline
+CLT_UPDATE_INTERVAL  = 0.25    # recalc score every 250 ms (not every frame)
+
+
 # Person-overlay colours  (BGR)
-PERSON_BOX_COLOR  = (130, 0, 75)   # indigo
+PERSON_BOX_COLOR  = (0, 200, 255)   # amber/gold
 UNKNOWN_BOX_COLOR = (120, 120, 120) # grey for unrecognised faces
+
 
 # Category → colour mapping
 CATEGORY_COLORS = {
@@ -78,6 +85,7 @@ for cat, classes in _cat_map.items():
 def _category_color(class_name: str):
     cat = CLASS_CATEGORY.get(class_name, "other")
     return CATEGORY_COLORS[cat]
+
 
 # Classes we should NOT search for on Google Shopping
 IGNORE_SEARCH_CLASSES = {
@@ -149,10 +157,10 @@ def _make_face_detector():
 #
 PEOPLE_REGISTRY: list[dict] = [
 
-    {"name": "Faisal", "age": 23, "role": "Student",
-         "photo_path": r"C:\\Users\\Pavel\\Pictures\\faisalphoto.jpg"},
-    {"name": "Sai", "age": 26, "role": "Engineer",
-         "photo_path": r"C:\\Users\\Pavel\\Pictures\\saikiran.jpg"},
+    {"name": "Faisal", "age": 22, "role": "Student",
+         "photo_path": r"C:\\Users\\Pavel\\Pictures\\faisal.jpg"},
+    {"name": "Sai Kiran", "age": 28, "role": "Engineer", 
+            "photo_path": r"C:\\Users\\Pavel\\Pictures\\saikiran.jpg"},
     # ← ADD YOUR ENTRIES HERE ↓
     # {"name": "Alice Smith",   "age": 29, "role": "Engineer",    "photo_path": "photos/alice.jpg"},
     # {"name": "Bob Johnson",   "age": 45, "role": "Businessman", "photo_path": "photos/bob.jpg"},
@@ -161,6 +169,174 @@ PEOPLE_REGISTRY: list[dict] = [
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Cognitive Load Tracker ────────────────────────────────────────────────────
+#
+#  READ-ONLY observer of eye signals.  Never writes to shared_data["eyeEvent"]
+#  so it won't collide with double-blink detection or any other event consumer.
+#
+ 
+class CognitiveLoadTracker:
+    """
+    Produces a 0–100 cognitive load score from three signals:
+      • pupil dilation vs personal baseline   (weight 0.45)
+      • blink rate  (low = focused/overloaded) (weight 0.25)
+      • fixation duration  (long = deep processing) (weight 0.30)
+ 
+    All signals are observed passively — nothing is consumed or modified.
+    """
+ 
+    def __init__(self):
+        self._pupil_history   = collections.deque()   # (timestamp, avg_pupil)
+        self._blink_times     = collections.deque()   # timestamps of detected blinks
+        self._fixation_durs   = collections.deque()   # (timestamp, duration_estimate)
+ 
+        self._baseline_pupil  = None
+        self._baseline_locked = False
+        self._start_time      = None
+ 
+        # Track event transitions (read-only) to count blinks
+        self._last_event      = ""
+        self._fixation_start  = None
+ 
+        # Output
+        self.score            = 0       # 0 = relaxed, 100 = overloaded
+        self.level            = "calm"  # "calm" | "focused" | "high"
+        self._last_calc       = 0
+ 
+    def update(self, pupil_avg: float, eye_event: str, now: float):
+        """Call every frame. Reads pupil + event, never writes to shared_data."""
+        if self._start_time is None:
+            self._start_time = now
+ 
+        # ── Record pupil ──────────────────────────────────────────────────────
+        if pupil_avg > 0:
+            self._pupil_history.append((now, pupil_avg))
+ 
+        # ── Detect blink transitions (READ-ONLY on eye_event) ─────────────────
+        #    "BB" = blink begin.  We count the transition INTO BB, not BB itself,
+        #    so repeated BB frames don't double-count.
+        if eye_event == "BB" and self._last_event != "BB":
+            self._blink_times.append(now)
+        self._last_event = eye_event
+ 
+        # ── Fixation duration tracking ────────────────────────────────────────
+        if eye_event == "FB":
+            if self._fixation_start is None:
+                self._fixation_start = now
+        else:
+            if self._fixation_start is not None:
+                dur = now - self._fixation_start
+                if dur > 0.05:  # ignore micro-fixations
+                    self._fixation_durs.append((now, dur))
+                self._fixation_start = None
+ 
+        # ── Trim old data outside the rolling window ──────────────────────────
+        cutoff = now - CLT_WINDOW_SEC
+        while self._pupil_history and self._pupil_history[0][0] < cutoff:
+            self._pupil_history.popleft()
+        while self._blink_times and self._blink_times[0] < cutoff:
+            self._blink_times.popleft()
+        while self._fixation_durs and self._fixation_durs[0][0] < cutoff:
+            self._fixation_durs.popleft()
+ 
+        # ── Learn baseline pupil from first N seconds ─────────────────────────
+        if not self._baseline_locked:
+            elapsed = now - self._start_time
+            if elapsed >= CLT_PUPIL_BASELINE_SEC and len(self._pupil_history) > 10:
+                vals = [v for _, v in self._pupil_history]
+                self._baseline_pupil = sum(vals) / len(vals)
+                self._baseline_locked = True
+                print(f"[CogLoad] Baseline pupil locked: {self._baseline_pupil:.2f}")
+ 
+        # ── Recalculate score (throttled) ─────────────────────────────────────
+        if now - self._last_calc < CLT_UPDATE_INTERVAL:
+            return
+        self._last_calc = now
+        self._calc_score(now)
+ 
+    def _calc_score(self, now: float):
+        # --- Pupil component (0–100) ---
+        pupil_score = 50  # neutral until baseline is ready
+        if self._baseline_pupil and self._baseline_pupil > 0 and self._pupil_history:
+            recent = [v for _, v in self._pupil_history]
+            avg    = sum(recent) / len(recent)
+            # +20% dilation → score 100,  −10% constriction → score 0
+            ratio  = (avg - self._baseline_pupil) / self._baseline_pupil
+            pupil_score = max(0, min(100, 50 + ratio * 250))
+ 
+        # --- Blink rate component (0–100) ---
+        blink_score = 50
+        window_len  = min(CLT_WINDOW_SEC, (now - self._start_time) if self._start_time else 1)
+        if window_len > 3:
+            blinks_per_min = len(self._blink_times) / window_len * 60
+            # Normal: ~15–20 blinks/min.  <8 = deep focus/overload, >25 = fatigue
+            if blinks_per_min < 8:
+                blink_score = 80 + min(20, (8 - blinks_per_min) * 3)
+            elif blinks_per_min > 25:
+                blink_score = 70 + min(30, (blinks_per_min - 25) * 2)
+            else:
+                blink_score = max(0, 50 - (blinks_per_min - 8) * 3)
+ 
+        # --- Fixation duration component (0–100) ---
+        fix_score = 50
+        if self._fixation_durs:
+            durations = [d for _, d in self._fixation_durs]
+            avg_dur   = sum(durations) / len(durations)
+            # >600 ms avg fixation = heavy processing, <200 ms = scanning
+            fix_score = max(0, min(100, (avg_dur - 0.2) / 0.5 * 100))
+ 
+        # --- Weighted blend ---
+        self.score = int(
+            pupil_score * 0.45 +
+            blink_score * 0.25 +
+            fix_score   * 0.30
+        )
+        self.score = max(0, min(100, self.score))
+ 
+        if self.score < 35:
+            self.level = "calm"
+        elif self.score < 65:
+            self.level = "focused"
+        else:
+            self.level = "high"
+ 
+ 
+def _draw_cognitive_bar(frame, tracker: CognitiveLoadTracker):
+    """Draw a small cognitive load meter in the top-right corner."""
+    score = tracker.score
+    level = tracker.level
+ 
+    bar_w, bar_h = 120, 16
+    margin = 10
+    x1 = frame.shape[1] - bar_w - margin
+    y1 = margin
+    x2 = x1 + bar_w
+    y2 = y1 + bar_h
+ 
+    # Background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1 - 2, y1 - 20), (x2 + 2, y2 + 2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+ 
+    # Colour: green → yellow → red
+    if score < 35:
+        color = (80, 200, 80)     # green
+    elif score < 65:
+        color = (0, 200, 255)     # yellow
+    else:
+        color = (50, 50, 230)     # red
+ 
+    # Filled portion
+    fill_w = int(bar_w * score / 100)
+    cv2.rectangle(frame, (x1, y1), (x1 + fill_w, y2), color, -1)
+    # Border
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 200, 200), 1)
+ 
+    # Label
+    label = f"Load: {score}%  ({level})"
+    cv2.putText(frame, label, (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
+ 
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
@@ -185,6 +361,9 @@ class process:
         # Active highlight overlays
         self.active_highlights = []
         self._lock             = threading.Lock()
+
+         # ── Cognitive load tracker (read-only observer) ───────────────────────
+        self.cog_tracker = CognitiveLoadTracker()
 
         # ── Person database ───────────────────────────────────────────────────
         print("Loading person database…")
@@ -394,7 +573,7 @@ class process:
                     box           = face_box,
                     label         = label,
                     class_name    = "person",
-                    color         = color,
+                    color         = _category_color(cls_name),
                     expires_at    = time.time() + HIGHLIGHT_FADE,
                     kind          = "person",
                     person        = person,
@@ -597,6 +776,10 @@ class process:
             elif self.current_event == "BB":
                 gaze_color = (255, 0, 0)
 
+
+            # ── Cognitive load update (read-only, won't touch eyeEvent) ───────
+            self.cog_tracker.update(current_pupil, self.current_event, now)
+
             # ── Dwell + pupil trigger ─────────────────────────────────────────
             if GazeX == 0 and GazeY == 0:
                 self.dwell_anchor     = None
@@ -688,6 +871,9 @@ class process:
 
             r = max(int(current_pupil), 4)
             cv2.circle(frame, (GazeX, GazeY), r, gaze_color, 2)
+
+             # ── Cognitive load indicator ──────────────────────────────────────
+            _draw_cognitive_bar(frame, self.cog_tracker)
 
             cv2.imshow("Video", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
