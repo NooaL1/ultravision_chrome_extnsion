@@ -399,17 +399,31 @@
   // Liuku 100 = trigger-instant: skippaa AINOASTAAN ENSIMMÄISEN merkin tylsyydestä
   //             dwell ~250 ms, pre-action 50 ms, min video 100 ms — käytännössä
   //             reagoi heti kun pupilli laskee tai katse karkaa.
+  // Sensitivity slider mapping. 0 = patient research mode, 100 = burn-it-down.
+  // At slider=100 the algorithm needs almost nothing to fire: any positive
+  // disinterest score, 80 ms dwell, no minVideo, no AND-gate, no confidence
+  // floor, and a 300 ms post-skip cooldown. Total time between skips ≈400 ms.
   function tunings() {
     const t = sensitivity / 100;   // 0 = patient, 1 = aggressive
     return {
-      T_high:    0.65 - t * 0.65,                  // 0.65 .. 0.00 z-space
-      T_low:     0.35 - t * 0.35,                  // 0.35 .. 0.00
-      dwellMs:   Math.max(250, 1500 - t * 1250),   // 1500 ms .. 250 ms
-      preStartMs: Math.max(50,  700  - t * 650),   // 700 ms  .. 50 ms
-      minVideoMs: Math.max(100, 2500 - t * 2400),  // 2500 ms .. 100 ms
-      reqAboveHigh: t < 0.33 ? 2 : 1,
-      reqSignals:   t > 0.70 ? 0 : (t < 0.50 ? 2 : 1),  // >70 = ei confidence flooria
-      skipCap:      Math.min(1.0, 0.25 + t * 0.85),     // 0.25 .. 1.00 (cap pois max:lla)
+      // T_high goes NEGATIVE at the very top so D=0 (baseline / not yet
+      // calibrated) already triggers — useful for demoing without waiting
+      // for the ~30-sample baseline to converge.
+      T_high:     0.65 - t * 0.95,                 // 0.65 ..  -0.30
+      T_low:      0.35 - t * 0.55,                 // 0.35 ..  -0.20
+      dwellMs:    Math.max(80,   1500 - t * 1420), // 1500 ms ..   80 ms
+      preStartMs: Math.max(0,    700  - t * 700),  //  700 ms ..    0 ms
+      minVideoMs: Math.max(0,    2500 - t * 2500), // 2500 ms ..    0 ms
+      // Multi-modal AND-gate: number of modalities that must exceed T_high
+      // simultaneously. 0 = effectively disabled.
+      reqAboveHigh: t < 0.33 ? 2 : (t > 0.85 ? 0 : 1),
+      // Confidence floor: signals with |z|>=0.5 required to fire.
+      reqSignals:   t > 0.70 ? 0 : (t < 0.50 ? 2 : 1),
+      // Skip-cap: fraction of session videos that may be auto-skipped.
+      skipCap:      Math.min(1.0, 0.25 + t * 0.85),
+      // Post-skip cooldown — also tightens at the top so consecutive skips
+      // can come within a fraction of a second.
+      postSkipMs:   Math.max(300, 1500 - t * 1200),  // 1500 ms .. 300 ms
     };
   }
 
@@ -465,17 +479,18 @@
     if (!enabled || !isShorts()) return;
     const now = performance.now();
     const elapsed = now - videoStartT;
+    const tunPre = tunings();
     if (Date.now() - lastManualScrollT < 5000) { setPreAction(0); return; }
-    if (Date.now() - lastSkipT < 1500) { setPreAction(0); return; }
+    if (Date.now() - lastSkipT < tunPre.postSkipMs) { setPreAction(0); return; }
 
-    // Päivitä yaw/pitch oscillation history
+    // Update yaw/pitch oscillation history
     if (state.headPose) {
       yawHist.push({ t: now, yaw: state.headPose.yaw });
       pitchHist.push({ t: now, pitch: state.headPose.pitch });
     }
 
-    // Headshake = forced-skip (override the slow algorithm)
-    if (detectHeadShake(now) && Date.now() - lastSkipT > 1500) {
+    // Headshake = forced skip (override the slow algorithm)
+    if (detectHeadShake(now) && Date.now() - lastSkipT > tunPre.postSkipMs) {
       skipNext('shake');
       return;
     }
