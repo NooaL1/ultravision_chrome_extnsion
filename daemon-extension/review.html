@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<title>Daemon — istunnon tarkastelu</title>
+<link rel="stylesheet" href="lecture.css">
+<link rel="stylesheet" href="review.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title">Istunto</h1>
+    <a href="sessions.html" class="link">← Kaikki istunnot</a>
+  </header>
+
+  <div class="hud">
+    <div class="metric"><div class="lbl">KESTO</div><div class="val" id="m-dur">—</div></div>
+    <div class="metric"><div class="lbl">KESKISYKE</div><div class="val" id="m-mean-bpm">—</div><div class="unit">bpm</div></div>
+    <div class="metric"><div class="lbl">FOCUS KESKIM.</div><div class="val" id="m-mean-focus">—</div><div class="unit">/100</div></div>
+    <div class="metric"><div class="lbl">HEIKOT HETKET</div><div class="val" id="m-dips">—</div></div>
+  </div>
+
+  <div class="player">
+    <audio id="audio" controls preload="metadata"></audio>
+  </div>
+
+  <div class="big-timeline">
+    <h2>Aikajana</h2>
+    <canvas id="bigtl" width="1040" height="180"></canvas>
+    <div class="legend">
+      <span class="lg lg-bpm">syke</span>
+      <span class="lg lg-focus">focus</span>
+      <span class="lg lg-dip">heikko hetki (klikkaa hypätäksesi)</span>
+      <span class="lg lg-cursor">toiston kohta</span>
+    </div>
+  </div>
+
+  <div class="emo-strip">
+    <h2>Tunteet ajan yli</h2>
+    <canvas id="emostrip" width="1040" height="40"></canvas>
+  </div>
+
+  <div class="transcript-box">
+    <h2>Transkriptio (klikkaa lausetta hypätäksesi)</h2>
+    <div class="transcript big" id="transcript"></div>
+  </div>
+
+  <div class="dips-list">
+    <h2>Suosittelut</h2>
+    <div id="dips"></div>
+  </div>
+</div>
+<script type="module" src="review.js"></script>
+</body>
+</html>

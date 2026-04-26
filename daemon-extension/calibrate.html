@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Daemon — kalibrointi</title>
+<style>
+  html, body { margin: 0; height: 100%; background: rgba(11,13,16,.96);
+    color: #fff; font: 14px -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden; }
+  .banner { position: fixed; left: 50%; top: 14px; transform: translateX(-50%);
+    background: rgba(0,0,0,.85); padding: 12px 22px; border-radius: 8px;
+    z-index: 10; text-align: center; max-width: 80vw; }
+  .banner b { color: #ff4d6d; }
+  .dot { position: fixed; width: 28px; height: 28px; margin: -14px 0 0 -14px;
+    border-radius: 50%; background: #ff4d6d; box-shadow: 0 0 18px #ff4d6d;
+    display: grid; place-items: center; font-weight: 700; cursor: pointer;
+    color: white; font-size: 12px;
+    animation: pulse 1.2s infinite ease-in-out; }
+  .dot.done { animation: none; background: #51cf66; box-shadow: 0 0 14px #51cf66; }
+  @keyframes pulse {
+    0%,100% { transform: scale(1); box-shadow: 0 0 18px #ff4d6d; }
+    50%     { transform: scale(1.4); box-shadow: 0 0 32px #ff4d6d; }
+  }
+  .hint { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; opacity: .5; }
+</style>
+<div class="banner" id="banner">Käynnistetään webgazeria…</div>
+<div class="hint">Esc sulkee ikkunan</div>
+<script src="lib/webgazer.min.js"></script>
+<script src="calibrate.js"></script>

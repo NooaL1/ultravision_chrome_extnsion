@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Daemon",
+  "version": "0.1.0",
+  "description": "Sees your heart rate and where you look. Magic.",
+  "permissions": ["offscreen", "storage", "tabs", "windows"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Daemon" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://www.youtube.com/shorts/*", "*://m.youtube.com/shorts/*", "*://www.youtube.com/*"],
+      "js": ["shorts.js"],
+      "css": ["shorts.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [{
+    "resources": ["lib/*", "wasm/*", "models/*"],
+    "matches": ["<all_urls>"]
+  }],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' ws://localhost:* ws://127.0.0.1:* http://localhost:* http://127.0.0.1:* https: data: blob:;"
+  }
+}

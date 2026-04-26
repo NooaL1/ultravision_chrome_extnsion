@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8" />
+<title>rPPG + gaze — live</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e6e6e6;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { display: grid; place-items: center; min-height: 100%; gap: 16px; padding: 20px; }
+  .stage { position: relative; width: min(720px, 92vw); aspect-ratio: 4/3;
+    background: #000; border-radius: 12px; overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  video { transform: scaleX(-1); }
+  #overlay { pointer-events: none; }
+  .badge { position: absolute; top: 10px; left: 10px; z-index: 5;
+    padding: 4px 10px; border-radius: 999px; font-size: 12px;
+    background: rgba(0,0,0,.6); backdrop-filter: blur(4px); }
+  .badge.ok  { color: #51cf66; }
+  .badge.bad { color: #ff6b6b; }
+  .hud { display: flex; gap: 24px; align-items: baseline; font-variant-numeric: tabular-nums; }
+  .bpm { font-size: 64px; font-weight: 700; letter-spacing: -1px; }
+  .bpm small { font-size: 16px; font-weight: 400; opacity: .6; margin-left: 6px; }
+  .meta { display: flex; flex-direction: column; gap: 4px; font-size: 13px; opacity: .75; }
+  .pulse { width: 12px; height: 12px; border-radius: 50%; background: #ff4d6d;
+    box-shadow: 0 0 12px #ff4d6d; animation: beat 1s infinite ease-out; }
+  @keyframes beat { 0%,100% { transform: scale(1); opacity: 1; }
+                    50%      { transform: scale(.6); opacity: .5; } }
+  .trace { width: min(720px, 92vw); height: 80px; background: #111418; border-radius: 8px; }
+  .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  .amp { width: 200px; height: 150px; background: #000; border-radius: 8px;
+    image-rendering: pixelated; box-shadow: 0 0 0 1px #2a6df4 inset; }
+  .amp-label { font-size: 11px; opacity: .6; text-align: center; margin-top: 4px; }
+  .legend { display: flex; gap: 12px; font-size: 11px; opacity: .7; }
+  .legend span::before { content: '■ '; }
+  .lr { color: #ff6b6b; } .lg { color: #51cf66; } .lb { color: #5c9eff; } .lh { color: #ff4d6d; }
+  button { background: #2a6df4; color: white; border: 0; padding: 10px 18px;
+    border-radius: 8px; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.alt { background: #2d3138; }
+  .hint { font-size: 12px; opacity: .5; max-width: 600px; text-align: center; }
+
+  /* gaze ball */
+  #gaze {
+    position: fixed; left: 0; top: 0; width: 28px; height: 28px;
+    margin: -14px 0 0 -14px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(80,200,255,.9), rgba(80,200,255,0));
+    box-shadow: 0 0 22px rgba(80,200,255,.7);
+    pointer-events: none;
+    z-index: 9999;
+    transition: transform .08s linear;
+    display: none;
+  }
+
+  /* calibration dots */
+  .cal-dot {
+    position: fixed; width: 28px; height: 28px; margin: -14px 0 0 -14px;
+    border-radius: 50%; background: #ff4d6d; box-shadow: 0 0 18px #ff4d6d;
+    z-index: 9998; cursor: pointer;
+    display: grid; place-items: center;
+    color: white; font-size: 12px; font-weight: 700;
+    animation: calpulse 1.2s infinite ease-in-out;
+  }
+  @keyframes calpulse {
+    0%,100% { transform: scale(1); box-shadow: 0 0 18px #ff4d6d; }
+    50%     { transform: scale(1.4); box-shadow: 0 0 32px #ff4d6d; }
+  }
+  .cal-dot.done { animation: none; background: #51cf66; box-shadow: 0 0 14px #51cf66; }
+  .cal-banner {
+    position: fixed; left: 50%; top: 14px; transform: translateX(-50%);
+    background: rgba(0,0,0,.85); padding: 12px 22px; border-radius: 8px;
+    font-size: 14px; z-index: 9998; text-align: center;
+  }
+  .cal-banner b { color: #ff4d6d; }
+  .cal-overlay {
+    position: fixed; inset: 0; background: rgba(11,13,16,.92);
+    z-index: 9997; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="gaze"></div>
+
+<div class="wrap">
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="faceBadge" class="badge bad">Ei kasvoja</div>
+  </div>
+
+  <div class="hud">
+    <div class="pulse" id="pulse" style="visibility:hidden"></div>
+    <div class="bpm"><span id="bpm">--</span><small>bpm</small></div>
+    <div class="meta">
+      <div>SNR: <span id="snr">--</span> dB</div>
+      <div>Buffer: <span id="buf">0</span>s / 10s</div>
+      <div>FPS: <span id="fps">--</span></div>
+      <div>Gaze: <span id="gazeStat">off</span></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <canvas class="amp" id="ampRaw" width="60" height="45"></canvas>
+      <div class="amp-label">ROI (otsasta)</div>
+    </div>
+    <div>
+      <canvas class="amp" id="ampMag" width="60" height="45"></canvas>
+      <div class="amp-label">ROI ×50</div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span class="lr">R</span><span class="lg">G</span><span class="lb">B</span>
+    <span class="lh">rPPG (POS)</span>
+  </div>
+  <canvas class="trace" id="traceRgb" width="720" height="80"></canvas>
+  <canvas class="trace" id="trace"    width="720" height="80"></canvas>
+
+  <div class="row">
+    <button id="start">Käynnistä webcam</button>
+    <button id="calBtn" class="alt" disabled>Kalibroi katse (9 pistettä)</button>
+  </div>
+  <div class="hint">
+    Kasvotunnistus etsii otsan automaattisesti. Jos ei löydy → lukemaa ei oteta.
+    Katseen kalibrointi: klikkaa jokaista punaista pistettä katsoen samalla suoraan siihen.
+  </div>
+</div>
+
+<!-- WebGazer (gaze tracking). Lataus jsDelivr-mirrorista, fallback brown.edu:hun. -->
+<script>
+(function loadWebgazer() {
+  const sources = [
+    "https://cdn.jsdelivr.net/npm/webgazer@3.3.0/dist/webgazer.min.js",
+    "https://webgazer.cs.brown.edu/webgazer.js"
+  ];
+  let i = 0;
+  function tryNext() {
+    if (i >= sources.length) {
+      window.__webgazerLoadError = "kaikki CDN-lähteet failasivat";
+      console.error("WebGazer load failed from all sources");
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = sources[i++];
+    s.onload = () => { window.__webgazerLoaded = true; console.log("WebGazer ladattu:", s.src); };
+    s.onerror = () => { console.warn("WebGazer load failed:", s.src); tryNext(); };
+    document.head.appendChild(s);
+  }
+  tryNext();
+})();
+</script>
+
+<script type="module">
+import {
+  FaceLandmarker, FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/vision_bundle.mjs";
+
+// ---------- DOM ----------
+const video    = document.getElementById('video');
+const overlay  = document.getElementById('overlay');
+const traceCv  = document.getElementById('trace');
+const bpmEl    = document.getElementById('bpm');
+const snrEl    = document.getElementById('snr');
+const bufEl    = document.getElementById('buf');
+const fpsEl    = document.getElementById('fps');
+const gazeStat = document.getElementById('gazeStat');
+const pulse    = document.getElementById('pulse');
+const startBtn = document.getElementById('start');
+const calBtn   = document.getElementById('calBtn');
+const faceBadge= document.getElementById('faceBadge');
+const gazeDot  = document.getElementById('gaze');
+
+const overlayCtx = overlay.getContext('2d');
+const traceCtx   = traceCv.getContext('2d');
+
+const ampRaw = document.getElementById('ampRaw');
+const ampMag = document.getElementById('ampMag');
+const ampRawCtx = ampRaw.getContext('2d', { willReadFrequently: true });
+const ampMagCtx = ampMag.getContext('2d');
+const AMP_W = ampRaw.width, AMP_H = ampRaw.height;
+const AMP_GAIN = 50, AMP_ALPHA = 0.03;
+let ampMean = null;
+const magImg = ampMagCtx.createImageData(AMP_W, AMP_H);
+
+const traceRgbCv  = document.getElementById('traceRgb');
+const traceRgbCtx = traceRgbCv.getContext('2d');
+
+// ---------- MediaPipe ----------
+let faceLandmarker = null;
+async function initFaceLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm"
+  );
+  faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numFaces: 1,
+    outputFaceBlendshapes: false,
+    outputFacialTransformationMatrixes: false
+  });
+}
+
+// ---------- buffers ----------
+const FS_TARGET = 30, WIN_SEC = 10;
+const N = FS_TARGET * WIN_SEC;
+const rBuf = [], gBuf = [], bBuf = [], tBuf = [];
+const traceBuf = new Array(traceCv.width).fill(0);
+let lastFpsT = performance.now(), frameCount = 0, fps = 0;
+let currentBpm = 0;
+const bpmHistory = [];
+
+// ---------- webcam ----------
+const sample = document.createElement('canvas');
+const sCtx   = sample.getContext('2d', { willReadFrequently: true });
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  startBtn.textContent = 'Ladataan malleja...';
+  try {
+    await initFaceLandmarker();
+    startBtn.textContent = 'Käynnistetään webcam...';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, frameRate: { ideal: 30 } }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    startBtn.style.display = 'none';
+    pulse.style.visibility = 'visible';
+    requestAnimationFrame(loop);
+
+    // start gaze tracking
+    initGaze().catch(err => console.warn('Gaze init failed', err));
+  } catch (e) {
+    startBtn.textContent = 'Virhe — klikkaa uudelleen';
+    startBtn.disabled = false;
+    console.error(e);
+  }
+};
+
+// ---------- main loop ----------
+let lastVideoTime = -1;
+function loop() {
+  if (!video.videoWidth) { requestAnimationFrame(loop); return; }
+
+  if (sample.width !== video.videoWidth) {
+    sample.width  = video.videoWidth;
+    sample.height = video.videoHeight;
+  }
+  sCtx.drawImage(video, 0, 0);
+
+  // Face detection
+  let roi = null;
+  if (faceLandmarker && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = faceLandmarker.detectForVideo(video, performance.now());
+    if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+      roi = computeForeheadROI(result.faceLandmarks[0], sample.width, sample.height);
+    }
+  }
+
+  // Overlay setup
+  overlay.width  = video.clientWidth;
+  overlay.height = video.clientHeight;
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+  if (roi) {
+    faceBadge.textContent = 'Kasvot OK';
+    faceBadge.className = 'badge ok';
+
+    sampleROI(roi);
+    drawROIOverlay(roi);
+  } else {
+    faceBadge.textContent = 'Ei kasvoja — sample paussilla';
+    faceBadge.className = 'badge bad';
+  }
+
+  // FPS
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsT > 500) {
+    fps = (frameCount * 1000) / (now - lastFpsT);
+    fpsEl.textContent = fps.toFixed(1);
+    frameCount = 0; lastFpsT = now;
+  }
+  bufEl.textContent = (tBuf.length / Math.max(fps, 1)).toFixed(1);
+
+  if (tBuf.length >= N && (frameCount % 15 === 0 || frameCount === 0)) {
+    analyze();
+  }
+
+  if (currentBpm > 0) pulse.style.animationDuration = (60/currentBpm) + 's';
+
+  drawTrace();
+  requestAnimationFrame(loop);
+}
+
+// ---------- ROI from landmarks ----------
+// MediaPipe FaceMesh: landmarks[10] = otsan keskiyläosa, landmarks[151] = otsan keskiosa,
+// 67 ja 297 = otsan vasen/oikea reuna, 9 = silmäkulmien välissä.
+// Otsa ROI = bounding box landmarkeista 10, 67, 297 yläosa, 9 alaosa, hieman insetillä.
+function computeForeheadROI(lm, W, H) {
+  const ids = [10, 67, 297, 9, 151, 108, 337, 69, 299];
+  let xmin=1, xmax=0, ymin=1, ymax=0;
+  for (const id of ids) {
+    const p = lm[id];
+    if (p.x < xmin) xmin = p.x;
+    if (p.x > xmax) xmax = p.x;
+    if (p.y < ymin) ymin = p.y;
+    if (p.y > ymax) ymax = p.y;
+  }
+  // inset: kavennetaan 10% leveydestä reunoilta + jätetään hieman tilaa hiusrajaan/kulmiin
+  const w = xmax - xmin, h = ymax - ymin;
+  xmin += w * 0.10; xmax -= w * 0.10;
+  ymin += h * 0.15; ymax -= h * 0.05;
+  return {
+    x: Math.max(0, Math.floor(xmin * W)),
+    y: Math.max(0, Math.floor(ymin * H)),
+    w: Math.max(1, Math.floor((xmax - xmin) * W)),
+    h: Math.max(1, Math.floor((ymax - ymin) * H))
+  };
+}
+
+function sampleROI({ x, y, w, h }) {
+  const img = sCtx.getImageData(x, y, w, h).data;
+  let sr=0, sg=0, sb=0, n=0;
+  for (let i=0; i<img.length; i+=4) {
+    const r=img[i], g=img[i+1], b=img[i+2];
+    const lum = (r+g+b)/3;
+    if (lum < 30 || lum > 245) continue;
+    sr+=r; sg+=g; sb+=b; n++;
+  }
+  if (n === 0) return;
+  const t = performance.now() / 1000;
+  rBuf.push(sr/n); gBuf.push(sg/n); bBuf.push(sb/n); tBuf.push(t);
+  while (tBuf.length > N) { rBuf.shift(); gBuf.shift(); bBuf.shift(); tBuf.shift(); }
+
+  // amplified preview
+  ampRawCtx.save();
+  ampRawCtx.translate(AMP_W, 0); ampRawCtx.scale(-1, 1);
+  ampRawCtx.drawImage(sample, x, y, w, h, 0, 0, AMP_W, AMP_H);
+  ampRawCtx.restore();
+  const cur = ampRawCtx.getImageData(0, 0, AMP_W, AMP_H).data;
+  if (!ampMean) {
+    ampMean = new Float32Array(cur.length);
+    for (let i=0; i<cur.length; i++) ampMean[i] = cur[i];
+  }
+  const out = magImg.data;
+  for (let i=0; i<cur.length; i+=4) {
+    for (let c=0; c<3; c++) {
+      const v = cur[i+c];
+      const m = ampMean[i+c] = ampMean[i+c] * (1-AMP_ALPHA) + v * AMP_ALPHA;
+      let amp = m + (v - m) * AMP_GAIN;
+      if (amp < 0) amp = 0; else if (amp > 255) amp = 255;
+      out[i+c] = amp;
+    }
+    out[i+3] = 255;
+  }
+  ampMagCtx.putImageData(magImg, 0, 0);
+}
+
+function drawROIOverlay({ x, y, w, h }) {
+  // skaalaa videon natiivikoosta overlay-canvasin (näytön) kokoon, peilattu.
+  const sx = overlay.width  - (x + w) * (overlay.width  / sample.width);
+  const sy = y * (overlay.height / sample.height);
+  const sw = w * (overlay.width  / sample.width);
+  const sh = h * (overlay.height / sample.height);
+  overlayCtx.strokeStyle = 'rgba(0,255,160,.85)';
+  overlayCtx.lineWidth = 2;
+  overlayCtx.setLineDash([6,6]);
+  overlayCtx.strokeRect(sx, sy, sw, sh);
+}
+
+// ---------- POS ----------
+function pos(r, g, b, fs) {
+  const L = r.length;
+  const winSize = Math.round(1.6 * fs);
+  const H = new Array(L).fill(0);
+  for (let n = winSize; n < L; n++) {
+    const m = n - winSize;
+    let mr=0, mg=0, mb=0;
+    for (let i=m; i<n; i++) { mr+=r[i]; mg+=g[i]; mb+=b[i]; }
+    mr/=winSize; mg/=winSize; mb/=winSize;
+    const X = new Array(winSize), Y = new Array(winSize);
+    for (let i=0; i<winSize; i++) {
+      const rn = r[m+i]/mr, gn = g[m+i]/mg, bn = b[m+i]/mb;
+      X[i] = gn - bn;
+      Y[i] = gn + bn - 2*rn;
+    }
+    let mx=0, my=0;
+    for (let i=0; i<winSize; i++){ mx+=X[i]; my+=Y[i]; }
+    mx/=winSize; my/=winSize;
+    let vx=0, vy=0;
+    for (let i=0; i<winSize; i++){ vx+=(X[i]-mx)**2; vy+=(Y[i]-my)**2; }
+    const sx = Math.sqrt(vx/winSize), sy = Math.sqrt(vy/winSize);
+    const alpha = sy === 0 ? 0 : sx / sy;
+    for (let i=0; i<winSize; i++) {
+      H[m+i] += (X[i] - mx) + alpha * (Y[i] - my);
+    }
+  }
+  return H;
+}
+
+function bpmFromSignal(h, fs) {
+  let mean = 0; for (const v of h) mean += v; mean /= h.length;
+  const x = new Array(h.length);
+  for (let i=0; i<h.length; i++) {
+    const w = 0.5 * (1 - Math.cos(2*Math.PI*i/(h.length-1)));
+    x[i] = (h[i] - mean) * w;
+  }
+  let bestBpm = 0, bestPow = 0, totalPow = 0;
+  const powers = [];
+  for (let bpm = 42; bpm <= 240; bpm += 0.5) {
+    const f = bpm / 60;
+    const w = 2 * Math.PI * f / fs;
+    let re=0, im=0;
+    for (let i=0; i<x.length; i++) {
+      re += x[i] * Math.cos(w*i);
+      im += x[i] * Math.sin(w*i);
+    }
+    const p = re*re + im*im;
+    powers.push(p);
+    totalPow += p;
+    if (p > bestPow) { bestPow = p; bestBpm = bpm; }
+  }
+  const snr = 10 * Math.log10(bestPow / ((totalPow - bestPow) / (powers.length - 1) + 1e-9));
+  return { bpm: bestBpm, snr };
+}
+
+function analyze() {
+  const dur = tBuf[tBuf.length-1] - tBuf[0];
+  const fsEff = (tBuf.length - 1) / dur;
+  if (!isFinite(fsEff) || fsEff < 10) return;
+  const h = pos(rBuf, gBuf, bBuf, fsEff);
+  const { bpm, snr } = bpmFromSignal(h, fsEff);
+  bpmHistory.push(bpm);
+  if (bpmHistory.length > 5) bpmHistory.shift();
+  const sorted = [...bpmHistory].sort((a,b)=>a-b);
+  currentBpm = sorted[sorted.length >> 1];
+  bpmEl.textContent = currentBpm.toFixed(0);
+  snrEl.textContent = snr.toFixed(1);
+
+  let mn=Infinity, mx=-Infinity;
+  for (const v of h) { if (v<mn) mn=v; if (v>mx) mx=v; }
+  const span = (mx - mn) || 1;
+  const stride = h.length / traceCv.width;
+  for (let i=0; i<traceCv.width; i++) {
+    const v = h[Math.floor(i*stride)] || 0;
+    traceBuf[i] = (v - mn) / span;
+  }
+}
+
+function drawTrace() {
+  traceCtx.clearRect(0,0,traceCv.width,traceCv.height);
+  traceCtx.strokeStyle = '#ff4d6d';
+  traceCtx.lineWidth = 1.5;
+  traceCtx.beginPath();
+  for (let i=0; i<traceBuf.length; i++) {
+    const y = traceCv.height - traceBuf[i] * (traceCv.height - 6) - 3;
+    if (i===0) traceCtx.moveTo(i, y); else traceCtx.lineTo(i, y);
+  }
+  traceCtx.stroke();
+  drawRgbTrace();
+}
+
+function drawRgbTrace() {
+  const ctx = traceRgbCtx, W = traceRgbCv.width, H = traceRgbCv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (rBuf.length < 8) return;
+  const channels = [
+    { buf: rBuf, color: '#ff6b6b' },
+    { buf: gBuf, color: '#51cf66' },
+    { buf: bBuf, color: '#5c9eff' },
+  ];
+  const L = rBuf.length;
+  const stride = L / W;
+  for (const { buf, color } of channels) {
+    let mn=Infinity, mx=-Infinity;
+    for (const v of buf) { if (v<mn) mn=v; if (v>mx) mx=v; }
+    const span = (mx - mn) || 1;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (let i=0; i<W; i++) {
+      const v = buf[Math.floor(i*stride)] || 0;
+      const y = H - ((v - mn) / span) * (H - 6) - 3;
+      if (i===0) ctx.moveTo(i, y); else ctx.lineTo(i, y);
+    }
+    ctx.stroke();
+  }
+}
+
+// ---------- gaze (WebGazer) ----------
+let gazeReady = false;
+let smoothX = 0, smoothY = 0;
+
+async function initGaze() {
+  gazeStat.textContent = 'ladataan...';
+  // odota että webgazer.js on latautunut (maks 15s)
+  const t0 = performance.now();
+  while (!window.webgazer && !window.__webgazerLoadError && performance.now() - t0 < 15000) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+  if (window.__webgazerLoadError) {
+    gazeStat.textContent = 'lataus epäonnistui (' + window.__webgazerLoadError + ')';
+    return;
+  }
+  if (!window.webgazer) {
+    gazeStat.textContent = 'timeout — webgazer ei latautunut';
+    return;
+  }
+
+  try {
+    // älä näytä webgazerin omaa video-overlayta (asetettava ENNEN beginiä)
+    webgazer.params.showVideoPreview = false;
+    webgazer.params.showFaceOverlay = false;
+    webgazer.params.showFaceFeedbackBox = false;
+    webgazer.params.showGazeDot = false;
+
+    webgazer
+      .setRegression('ridge')
+      .setGazeListener((data) => {
+        if (!data) return;
+        // kevyempi smoothing -> pallo seuraa nopeammin
+        smoothX = smoothX * 0.45 + data.x * 0.55;
+        smoothY = smoothY * 0.45 + data.y * 0.55;
+        gazeDot.style.transform = `translate(${smoothX}px, ${smoothY}px)`;
+      });
+
+    gazeStat.textContent = 'käynnistetään...';
+    await webgazer.begin();
+
+    // jotkin versiot vaativat näiden uudelleenkutsumista beginin jälkeen
+    try {
+      webgazer.showVideoPreview(false).showPredictionPoints(false).showFaceOverlay(false).showFaceFeedbackBox(false);
+    } catch (e) { /* metodit puuttuu joistain versioista — ei haittaa */ }
+
+    gazeReady = true;
+    gazeDot.style.display = 'block';
+    gazeStat.textContent = 'on (kalibroi parempaa tarkkuutta)';
+    calBtn.disabled = false;
+  } catch (err) {
+    console.error('webgazer.begin() failed:', err);
+    gazeStat.textContent = 'begin failasi: ' + (err && err.message || err);
+  }
+}
+
+// ---------- kalibrointi (13 pistettä, eksplisiittinen recordScreenPosition) ----------
+calBtn.onclick = async () => {
+  if (!gazeReady) return;
+  webgazer.clearData();
+  calBtn.disabled = true;
+  gazeDot.style.display = 'none';
+
+  // 13 pistettä: 9-grid + 4 keskialueen pistettä paremmalle keskitarkkuudelle
+  const positions = [
+    [0.08, 0.10], [0.50, 0.10], [0.92, 0.10],
+    [0.08, 0.50], [0.30, 0.30], [0.50, 0.50], [0.70, 0.30],
+    [0.30, 0.70], [0.92, 0.50], [0.70, 0.70],
+    [0.08, 0.90], [0.50, 0.90], [0.92, 0.90],
+  ];
+
+  const overlay = document.createElement('div');
+  overlay.className = 'cal-overlay';
+  document.body.appendChild(overlay);
+  const banner = document.createElement('div');
+  banner.className = 'cal-banner';
+  document.body.appendChild(banner);
+
+  const CLICKS_PER_DOT = 5;
+
+  for (let i = 0; i < positions.length; i++) {
+    const [px, py] = positions[i];
+    const x = window.innerWidth  * px;
+    const y = window.innerHeight * py;
+
+    banner.innerHTML = `Pidä katse <b>punaisessa pallossa</b> ja klikkaa sitä ${CLICKS_PER_DOT} kertaa &nbsp;·&nbsp; piste ${i+1} / ${positions.length}`;
+
+    const dot = document.createElement('div');
+    dot.className = 'cal-dot';
+    dot.style.left = x + 'px';
+    dot.style.top  = y + 'px';
+    dot.textContent = String(CLICKS_PER_DOT);
+    document.body.appendChild(dot);
+
+    // pieni viive jotta katse ehtii pisteeseen
+    await new Promise(r => setTimeout(r, 350));
+
+    let clicks = 0;
+    await new Promise(resolve => {
+      dot.onclick = (ev) => {
+        ev.stopPropagation();
+        // Kerro WebGazerille pisteen TARKAT koordinaatit, ei klikin sijaintia
+        webgazer.recordScreenPosition(x, y, 'click');
+        clicks++;
+        dot.textContent = String(CLICKS_PER_DOT - clicks);
+        if (clicks >= CLICKS_PER_DOT) {
+          dot.classList.add('done');
+          setTimeout(() => { dot.remove(); resolve(); }, 150);
+        }
+      };
+    });
+  }
+
+  // ---- validointi: katso 2s keskelle, mitataan keskimääräinen virhe ----
+  banner.innerHTML = 'Katso <b>vihreää palloa</b> 2 sekuntia (älä klikkaa)';
+  const cx = window.innerWidth/2, cy = window.innerHeight/2;
+  const valDot = document.createElement('div');
+  valDot.className = 'cal-dot done';
+  valDot.style.left = cx + 'px';
+  valDot.style.top  = cy + 'px';
+  document.body.appendChild(valDot);
+  await new Promise(r => setTimeout(r, 500)); // anna katseen siirtyä
+
+  const samples = [];
+  const tEnd = performance.now() + 2000;
+  while (performance.now() < tEnd) {
+    const pred = await webgazer.getCurrentPrediction();
+    if (pred) samples.push([pred.x, pred.y]);
+    await new Promise(r => setTimeout(r, 50));
+  }
+  valDot.remove();
+
+  let avgErr = NaN;
+  if (samples.length > 5) {
+    let sum = 0;
+    for (const [x,y] of samples) sum += Math.hypot(x - cx, y - cy);
+    avgErr = sum / samples.length;
+  }
+
+  banner.remove();
+  overlay.remove();
+  gazeDot.style.display = 'block';
+  calBtn.disabled = false;
+
+  if (isFinite(avgErr)) {
+    const quality = avgErr < 80 ? '✓ hyvä' : avgErr < 160 ? '~ ok' : '× heikko, kalibroi uudelleen';
+    gazeStat.textContent = `kalibroitu — ±${avgErr.toFixed(0)}px (${quality})`;
+  } else {
+    gazeStat.textContent = 'kalibroitu (ei validointidataa)';
+  }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<title>Daemon — luentotila</title>
+<link rel="stylesheet" href="lecture.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Luentotila</h1>
+    <div class="status" id="status">valmis</div>
+  </header>
+
+  <div class="hud">
+    <div class="metric"><div class="lbl">SYKE</div><div class="val" id="m-bpm">—</div><div class="unit">bpm</div></div>
+    <div class="metric"><div class="lbl">FOCUS</div><div class="val" id="m-focus">—</div><div class="unit">/100</div></div>
+    <div class="metric"><div class="lbl">TUNNE</div><div class="val small" id="m-emotion">—</div></div>
+    <div class="metric"><div class="lbl">KESTO</div><div class="val" id="m-time">0:00</div></div>
+  </div>
+
+  <div class="main">
+    <section class="left">
+      <h2>Transkriptio · suomi</h2>
+      <div class="transcript" id="transcript">
+        <div class="hint">Käynnistä äänitys → puhe näkyy tässä reaaliajassa.</div>
+      </div>
+    </section>
+    <section class="right">
+      <h2>Aikajana</h2>
+      <canvas id="timeline" width="380" height="220"></canvas>
+      <div class="legend">
+        <span class="lg lg-bpm">syke</span>
+        <span class="lg lg-focus">focus</span>
+        <span class="lg lg-dip">heikko hetki</span>
+      </div>
+    </section>
+  </div>
+
+  <div class="controls">
+    <button id="start" class="big">● Aloita äänitys</button>
+    <button id="stop"  class="big alt" disabled>■ Lopeta &amp; tallenna</button>
+    <button id="cancel" class="alt small" disabled>peruuta</button>
+    <a href="sessions.html" class="link">Aiemmat istunnot →</a>
+  </div>
+
+  <div class="note">
+    Ääni tallennetaan paikallisesti selaimeen. Transkriptio käyttää Chromen
+    SpeechRecognition-rajapintaa joka lähettää äänen Googlen palvelimille reaaliajassa.
+    Daemonin biometria (syke, ilmeet, focus) lasketaan paikallisesti.
+  </div>
+</div>
+<script type="module" src="lecture.js"></script>
+</body>
+</html>

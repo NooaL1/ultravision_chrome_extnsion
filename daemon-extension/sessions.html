@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<title>Daemon — istunnot</title>
+<link rel="stylesheet" href="lecture.css">
+<style>
+  .session-list { display: flex; flex-direction: column; gap: 8px; }
+  .session-card {
+    display: grid; grid-template-columns: 1fr auto auto auto;
+    gap: 16px; align-items: center;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+    padding: 14px 16px; border-radius: 10px; cursor: pointer;
+    transition: background .15s;
+  }
+  .session-card:hover { background: rgba(255,255,255,.06); }
+  .s-title { font-weight: 600; }
+  .s-stat  { font-size: 12px; opacity: .6; font-variant-numeric: tabular-nums; }
+  .s-del { background: transparent; color: #ff8c8c; border: 1px solid rgba(255,140,140,.3);
+    padding: 6px 10px; border-radius: 6px; font-size: 11px; }
+  .empty { text-align: center; padding: 60px; opacity: .4; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Istunnot</h1>
+    <a href="lecture.html" class="link">Uusi istunto →</a>
+  </header>
+  <div class="session-list" id="list">
+    <div class="empty">Ladataan...</div>
+  </div>
+</div>
+<script type="module">
+import { listSessions, deleteSession } from './idb.js';
+const list = document.getElementById('list');
+const sessions = await listSessions();
+if (sessions.length === 0) {
+  list.innerHTML = '<div class="empty">Ei vielä istuntoja. Aloita ensimmäinen yllä olevasta linkistä.</div>';
+} else {
+  list.innerHTML = sessions.map(s => {
+    const d = new Date(s.startedAt).toLocaleString('fi-FI');
+    const dur = fmt(s.durationMs/1000);
+    const segs = (s.transcript || []).length;
+    const bpms = (s.bio || []).filter(b => b.bpm).map(b => b.bpm);
+    const meanBpm = bpms.length ? Math.round(bpms.reduce((a,b)=>a+b,0)/bpms.length) : '—';
+    return `<div class="session-card" data-id="${s.id}">
+      <div>
+        <div class="s-title">${escape(s.title || 'Istunto')}</div>
+        <div class="s-stat">${d}</div>
+      </div>
+      <div class="s-stat">${dur}</div>
+      <div class="s-stat">${meanBpm} bpm · ${segs} segm.</div>
+      <button class="s-del" data-del="${s.id}">poista</button>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.session-card').forEach(c => {
+    c.onclick = (e) => {
+      if (e.target.dataset.del) return;
+      location.href = 'review.html?id=' + c.dataset.id;
+    };
+  });
+  list.querySelectorAll('.s-del').forEach(b => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm('Poistetaanko istunto pysyvästi?')) return;
+      await deleteSession(b.dataset.del);
+      location.reload();
+    };
+  });
+}
+function fmt(s) { const m=Math.floor(s/60), ss=Math.floor(s%60); return `${m}:${String(ss).padStart(2,'0')}`; }
+function escape(s) { return (s||'').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+</script>
+</body>
+</html>
