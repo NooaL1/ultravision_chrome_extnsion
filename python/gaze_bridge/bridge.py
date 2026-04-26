@@ -5,8 +5,21 @@ Chrome extension can read gaze + pupil data, plus runs MediaPipe
 hand-tracking on the scene-cam feed in a separate process so the
 cv2.imshow window works reliably on Windows.
 
-Run alongside the eye tracker:
+Common setups
+-------------
+Hackathon kit (SeeTrue oletus 172.20.10.3, connect-tila):
+    python bridge.py
+Eri IP:
     python bridge.py --remote_ip 192.168.10.201
+Reverse direction — SeeTrue PUSHaa laptopille (laptop bindaa porttiin):
+    python bridge.py --bind
+Ei laitetta, käytä simulaattoria (aja toisessa terminaalissa
+gaze_data_simulator/simulator.py):
+    python bridge.py --simulator
+Kevyt RAM-profiili demoon (oletus jo no-webcam, lisätään headless):
+    python bridge.py --no-display
+Älä lataa MediaPipea ollenkaan (vain WebSocket-bridge SeeTrue-datalle):
+    python bridge.py --no-gesture
 """
 
 import argparse
@@ -37,12 +50,137 @@ DRAG_THRESHOLD    = 0.10    # min Δy during pinch to count as a swipe
 
 clients: set = set()
 
+# SeeTrue liveness — gaze_loop päivittää, heartbeat_loop ja stdout lukevat.
+# time.monotonic() pohjainen jotta kellovaihdot eivät häiritse.
+last_gaze_ts: float = 0.0
+gaze_msg_count: int = 0
+
+
+# ── SeeTrue UDP/ZMQ handshake ───────────────────────────────────────────────
+# Server (SeeTrueEyeServer.exe) push-aa ZMQ:ta vasta kun client on lähettänyt
+# UDP "runPictureProcessing" -komennon porttiin INITIAL_PORT (3429).
+# Notifikaatiot tulevat takaisin ZMQ-portista 3430 (initial+1).
+# Tämä funktio matkii sitä mitä SeeTrueTechLauncher.exe tekee: device discovery
+# → pick → start. Auto mode = "haetaan listalta ensimmäinen, käynnistetään".
+INITIAL_PORT       = 3429   # UDP control
+NOTIFICATIONS_PORT = 3430   # ZMQ notifications (initial+1)
+
+
+def kick_seetrue_stream(remote_ip: str, timeout_s: float = 4.0,
+                        prefer_device: str | None = None) -> bool:
+    """Send the UDP commands needed to start the SeeTrue ZMQ stream.
+
+    Returns True if at least the runPictureProcessing was sent (server may or
+    may not start streaming depending on calibration state).
+    """
+    import socket
+    import zmq as zmq_local
+
+    print(f"[handshake] kicking SeeTrueEyeServer at {remote_ip}:{INITIAL_PORT}")
+
+    # 1) ZMQ PULL for notifications coming back from server
+    ctx = zmq_local.Context()
+    notif_sock = ctx.socket(zmq_local.PULL)
+    notif_sock.RCVTIMEO = int(timeout_s * 1000)
+    try:
+        notif_sock.connect(f"tcp://{remote_ip}:{NOTIFICATIONS_PORT}")
+    except Exception as exc:
+        print(f"[handshake] notif PULL connect failed: {exc}")
+        notif_sock.close(); ctx.term()
+        return False
+
+    # 2) UDP socket for sending commands
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send_cmd(d: dict):
+        msg = json.dumps(d).encode("utf-8")
+        udp.sendto(msg, (remote_ip, INITIAL_PORT))
+        print(f"[handshake] → UDP {d}")
+
+    # 3) Discover devices
+    send_cmd({"action": "sendEyeTrackerTypeData"})
+
+    device = prefer_device
+    deadline = time.monotonic() + timeout_s
+    while device is None and time.monotonic() < deadline:
+        try:
+            raw = notif_sock.recv_string()
+        except zmq_local.error.Again:
+            break
+        except Exception as exc:
+            print(f"[handshake] notif recv error: {exc}")
+            break
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        msg = obj.get("message") or {}
+        # API: code 20 = list of EyeTracking devices. Voi tulla "devices"-listana
+        # tai erikseen merkkijonoissa device_specific_identifier. Ota mitä saadaan.
+        candidates = []
+        for k in ("devices", "deviceList", "eyeTrackerList", "trackers"):
+            v = msg.get(k)
+            if isinstance(v, list) and v:
+                candidates.extend([str(x) for x in v])
+        # joskus payload on suoraan stringi
+        if not candidates:
+            for k in ("device", "eyeTrackerDevice", "eyeTrackerType"):
+                v = msg.get(k)
+                if isinstance(v, str) and v:
+                    candidates.append(v)
+        if candidates:
+            device = candidates[0]
+            print(f"[handshake] picked device: {device} (alternatives: {candidates})")
+            break
+        else:
+            print(f"[handshake] notification: {obj}")
+
+    if device is None:
+        # Fallback: serveri ei vastannut device-listalla. Yritetään silti
+        # runPictureProcessing tyhjällä eyeTrackerType:llä — joillakin versioilla
+        # tämä toimii kun kalibrointi on aiemmin tehty.
+        print("[handshake] no device list — trying blind start with empty type")
+        device = ""
+
+    # 4) Set device + start picture processing
+    if device:
+        send_cmd({"action": "setEyeTrackerDevice", "eyeTrackerDevice": device})
+        time.sleep(0.2)
+
+    send_cmd({
+        "action": "runPictureProcessing",
+        "executableStreams": {
+            "recEyeData":      True,
+            "recLeftEyeData":  False,
+            "recRightEyeData": False,
+            "recSceneData":    True,
+        },
+        "eyeTrackerType":  device,
+        "calibrationData": "",
+    })
+
+    # 5) Lopeta — anna serverin aikaa vaihtaa tilaa
+    time.sleep(0.3)
+    udp.close()
+    notif_sock.close()
+    ctx.term()
+    print("[handshake] done — bridge will now listen on ZMQ for gaze data")
+    return True
+
 
 async def ws_handler(ws):
     clients.add(ws)
     print(f"[WS] client connected (total={len(clients)})")
+    inbound = 0
     try:
-        await ws.wait_closed()
+        async for raw in ws:
+            inbound += 1
+            if inbound <= 3 or inbound % 200 == 0:
+                preview = raw if len(raw) < 160 else raw[:160] + "…"
+                print(f"[WS] inbound #{inbound}: {preview}")
+            await broadcast_to_others(raw, sender=ws)
+    except Exception as exc:
+        print(f"[WS] handler error: {exc}")
     finally:
         clients.discard(ws)
         print(f"[WS] client disconnected (total={len(clients)})")
@@ -56,25 +194,88 @@ async def broadcast(msg: str):
     )
 
 
-# ── Gaze loop (asyncio) ─────────────────────────────────────────────────────
-async def gaze_loop(remote_ip: str):
-    ctx  = zmq.asyncio.Context()
-    sock = ctx.socket(zmq.PULL)
-    sock.setsockopt(zmq.RCVHWM, 0)
-    sock.connect(f"tcp://{remote_ip}:{GAZE_PORT}")
-    print(f"[ZMQ] gaze PULL connected to tcp://{remote_ip}:{GAZE_PORT}")
+async def broadcast_to_others(msg: str, sender):
+    targets = [c for c in clients if c is not sender]
+    if not targets:
+        return
+    await asyncio.gather(
+        *[c.send(msg) for c in targets], return_exceptions=True
+    )
+
+
+# ── Gaze worker subprocess (sync zmq, drained by asyncio relay) ────────────
+# HUOM: aiempi versio käytti zmq.asyncio.Context()-luokkaa main loopissa.
+# Windows + Python 3.11 + pyzmq + asyncio yhdistelmässä on raportoitu ettei
+# data koskaan saavu vaikka connect onnistuu. simple_gaze_receiverin pattern
+# (sync ZMQ erillisessä prosessissa, blocking recv) toimii varmasti — käytetään
+# sitä ja relayataan parsittu data multiprocessing.Queue:n kautta asyncio-puolelle.
+def gaze_worker(remote_ip: str, gaze_q, bind_mode: bool = False):
+    """Subprocess: sync zmq.PULL → parse → push to gaze_q.
+    Sama tapa kuin simple_gaze_receiver/EyeTrackingReceiver mutta ilman
+    shared_data-kerrosta — vain raaka relay."""
+    import zmq as zmq_local
+    ctx  = zmq_local.Context()
+    sock = ctx.socket(zmq_local.PULL)
+    sock.setsockopt(zmq_local.RCVHWM, 0)
+    sock.RCVTIMEO = 2000  # ms — tasapaino: ei rosvoa CPU:ta, lokit kerran/2s
+    if bind_mode:
+        endpoint = f"tcp://0.0.0.0:{GAZE_PORT}"
+        sock.bind(endpoint)
+        print(f"[ZMQ] gaze PULL bound on {endpoint} (waiting for SeeTrue PUSH)")
+    else:
+        endpoint = f"tcp://{remote_ip}:{GAZE_PORT}"
+        sock.connect(endpoint)
+        print(f"[ZMQ] gaze PULL connected to {endpoint}")
+
     msg_count = 0
+    stall_count = 0
+    last_recv_ts = 0.0
+    eyes_warned = False
+
     while True:
         try:
-            raw = await sock.recv_string()
+            raw = sock.recv_string()
+        except zmq_local.error.Again:
+            stall_count += 1
+            age = (time.monotonic() - last_recv_ts) if last_recv_ts else None
+            if age is None:
+                print(f"[ZMQ] still waiting for first gaze sample "
+                      f"(stall #{stall_count}). Tarkista: SeeTrue päällä? "
+                      f"IP/portti? Kokeile --bind tai --simulator.")
+            else:
+                print(f"[ZMQ] no gaze data — {age:.1f}s since last sample")
+            continue
+        except Exception as exc:
+            print(f"[ZMQ] gaze recv error: {type(exc).__name__}: {exc}")
+            time.sleep(0.5)
+            continue
+
+        try:
             msg_count += 1
+            last_recv_ts = time.monotonic()
             fields = raw.strip().split(";")
             if len(fields) < 21:
                 continue
             event = fields[20].strip()
+            # main.py vertailee " NA" — meidän strip()+vertailu kattaa molemmat
             if event == "NA":
+                if not eyes_warned:
+                    print("[ZMQ] eyes not detected (event=NA) — gaze receives "
+                          "frames but tracker ei näe silmiä. Kalibroi/asettele.")
+                    eyes_warned = True
+                # Lähetä silti heartbeat-päivitys — bridge tietää että data virtaa
+                try:
+                    gaze_q.put_nowait({"source": "ovision-gaze",
+                                       "_alive_only": True,
+                                       "event": "NA"})
+                except Exception:
+                    pass
                 continue
+            if eyes_warned:
+                print("[ZMQ] eyes detected again — resuming gaze stream.")
+                eyes_warned = False
             data = {
+                "source": "ovision-gaze",
                 "ts":     float(fields[1]),
                 "gx":     float(fields[2]),
                 "gy":     float(fields[3]),
@@ -82,17 +283,41 @@ async def gaze_loop(remote_ip: str):
                 "pupilR": float(fields[5]),
                 "event":  event,
             }
-            if msg_count <= 3:
-                print(f"[ZMQ] gaze parsed: {data}")
-            await broadcast(json.dumps(data))
+            if msg_count <= 3 or msg_count % 500 == 0:
+                print(f"[ZMQ] gaze parsed #{msg_count}: {data}")
+            try:
+                gaze_q.put_nowait(data)
+            except Exception:
+                pass  # queue full — drop, fresh data will follow
         except (ValueError, IndexError):
             continue
         except Exception as exc:
-            print(f"[ZMQ] gaze error: {exc}")
+            print(f"[ZMQ] gaze parse error: {exc}")
+
+
+# ── Async relay: pull from gaze_q → broadcast WS + update liveness counters ─
+async def gaze_relay(q):
+    global last_gaze_ts, gaze_msg_count
+    while True:
+        try:
+            evt = q.get_nowait()
+        except Exception:
+            await asyncio.sleep(0.01)
+            continue
+        last_gaze_ts = time.monotonic()
+        gaze_msg_count += 1
+        # Älä broadcastaa pelkkää alive-pingiä — vain heartbeat hyödyntää sitä
+        if evt.get("_alive_only"):
+            continue
+        try:
+            await broadcast(json.dumps(evt))
+        except Exception as exc:
+            print(f"[gaze_relay] broadcast error: {exc}")
 
 
 # ── Gesture worker subprocess (cv2.imshow safe in main thread) ──────────────
-def gesture_worker(remote_ip: str, gesture_q):
+def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
+                   show_window: bool = True):
     """Runs in its own process so cv2.imshow + cv2.waitKey work properly."""
     import zmq as zmq_local
     import numpy as np
@@ -102,8 +327,14 @@ def gesture_worker(remote_ip: str, gesture_q):
     ctx  = zmq_local.Context()
     sock = ctx.socket(zmq_local.PULL)
     sock.setsockopt(zmq_local.RCVHWM, 0)
-    sock.connect(f"tcp://{remote_ip}:{SCENE_PORT}")
-    print(f"[Gesture] subprocess connected to tcp://{remote_ip}:{SCENE_PORT}")
+    if bind_mode:
+        endpoint = f"tcp://0.0.0.0:{SCENE_PORT}"
+        sock.bind(endpoint)
+        print(f"[Gesture] subprocess bound on {endpoint} (waiting for PUSH)")
+    else:
+        endpoint = f"tcp://{remote_ip}:{SCENE_PORT}"
+        sock.connect(endpoint)
+        print(f"[Gesture] subprocess connected to {endpoint}")
 
     hands  = mp.solutions.hands.Hands(
         max_num_hands=1, min_detection_confidence=0.55,
@@ -112,8 +343,9 @@ def gesture_worker(remote_ip: str, gesture_q):
     drawer = mp.solutions.drawing_utils
     style  = mp.solutions.drawing_styles
 
-    cv.namedWindow("Gesture debug", cv.WINDOW_NORMAL)
-    cv.resizeWindow("Gesture debug", 800, 600)
+    if show_window:
+        cv.namedWindow("Gesture debug", cv.WINDOW_NORMAL)
+        cv.resizeWindow("Gesture debug", 800, 600)
 
     last_swipe_ts    = 0.0
     last_swipe_label = ""
@@ -188,7 +420,8 @@ def gesture_worker(remote_ip: str, gesture_q):
                     last_swipe_label = f"SWIPE {gesture.upper()}"
                     last_swipe_at    = now
                     try:
-                        gesture_q.put_nowait({"gesture": gesture, "ts": now})
+                        gesture_q.put_nowait({"source": "ovision-gesture",
+                                              "gesture": gesture, "ts": now})
                     except Exception:
                         pass
                 grab_start_y = None
@@ -249,13 +482,17 @@ def gesture_worker(remote_ip: str, gesture_q):
             cv.putText(img, last_swipe_label, (cx, h//2),
                        cv.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3, cv.LINE_AA)
 
-        cv.imshow("Gesture debug", img)
-        if cv.waitKey(1) & 0xFF == ord("q"):
-            break
+        if show_window:
+            cv.imshow("Gesture debug", img)
+            if cv.waitKey(1) & 0xFF == ord("q"):
+                break
+        else:
+            # Headless: anna prosessorin hengittää, älä kuluta täyttä CPU:ta
+            time.sleep(0.001)
 
 
 # ── Webcam worker (face expression + secondary hand tracking) ──────────────
-def webcam_worker(gesture_q, cam_index=0):
+def webcam_worker(gesture_q, cam_index=0, show_window: bool = True):
     """Reads laptop webcam → MediaPipe face mesh + hands. Pushes face
     expression metrics + (optional) gesture events into the queue.
     Runs in its own process so cv2.imshow works on Windows."""
@@ -279,8 +516,9 @@ def webcam_worker(gesture_q, cam_index=0):
         min_detection_confidence=0.55, min_tracking_confidence=0.45,
     )
 
-    cv.namedWindow("Webcam debug", cv.WINDOW_NORMAL)
-    cv.resizeWindow("Webcam debug", 700, 500)
+    if show_window:
+        cv.namedWindow("Webcam debug", cv.WINDOW_NORMAL)
+        cv.resizeWindow("Webcam debug", 700, 500)
 
     last_face_send = 0.0
     last_swipe_ts  = 0.0
@@ -362,7 +600,8 @@ def webcam_worker(gesture_q, cam_index=0):
 
             # Send periodically
             if now - last_face_send > 0.4:
-                msg = {"face": face_metrics, "ts": now}
+                msg = {"source": "ovision-face",
+                       "face": face_metrics, "ts": now}
                 try:
                     gesture_q.put_nowait(msg)
                 except Exception:
@@ -385,8 +624,9 @@ def webcam_worker(gesture_q, cam_index=0):
                     print(f"[Webcam] SWIPE {g.upper()} (Δy {d:+.2f})")
                     last_swipe_ts = now
                     try:
-                        gesture_q.put_nowait({"gesture": g, "ts": now,
-                                              "source": "webcam"})
+                        gesture_q.put_nowait({"source": "ovision-gesture",
+                                              "gesture": g, "ts": now,
+                                              "via": "webcam"})
                     except Exception:
                         pass
                 grab_start_y = None
@@ -412,12 +652,16 @@ def webcam_worker(gesture_q, cam_index=0):
             cv.putText(frame, "GRABBED", (10, h-20),
                        cv.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv.LINE_AA)
 
-        cv.imshow("Webcam debug", frame)
-        if cv.waitKey(1) & 0xFF == ord("q"):
-            break
+        if show_window:
+            cv.imshow("Webcam debug", frame)
+            if cv.waitKey(1) & 0xFF == ord("q"):
+                break
+        else:
+            time.sleep(0.001)
 
     cap.release()
-    cv.destroyAllWindows()
+    if show_window:
+        cv.destroyAllWindows()
 
 
 # ── Bridge between gesture queue and WS broadcast (asyncio) ─────────────────
@@ -430,30 +674,149 @@ async def gesture_relay(q):
             await asyncio.sleep(0.03)
 
 
+# ── Heartbeat: 1 Hz status broadcast for HUD diagnostics ───────────────────
+async def heartbeat_loop():
+    last_count = 0
+    while True:
+        await asyncio.sleep(1.0)
+        now = time.monotonic()
+        rate = gaze_msg_count - last_count
+        last_count = gaze_msg_count
+        seetrue_alive = (last_gaze_ts > 0.0 and (now - last_gaze_ts) < 2.0)
+        msg = json.dumps({
+            "source": "bridge",
+            "heartbeat": True,
+            "seetrue_alive": seetrue_alive,
+            "msgs_per_sec": rate,
+            "last_event_age_s":
+                None if last_gaze_ts == 0.0 else round(now - last_gaze_ts, 2),
+            "total_msgs": gaze_msg_count,
+        })
+        await broadcast(msg)
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--remote_ip", default="192.168.10.201")
+    parser = argparse.ArgumentParser(
+        description="SeeTrue ↔ WebSocket bridge with optional MediaPipe gestures."
+    )
+    parser.add_argument("--remote_ip", default="172.20.10.3",
+        help="SeeTrue device IP (when --bind not set). Default: 172.20.10.3 "
+             "(matches simple_gaze_receiver/main.py default).")
+    parser.add_argument("--enable-webcam", action="store_true",
+        help="Run the webcam_worker (face mesh + hand). OFF by default — "
+             "Daemon-laajennus tekee saman tehokkaammin selainpuolella.")
+    parser.add_argument("--no-gesture", action="store_true",
+        help="Skip the MediaPipe hand-gesture worker entirely. Saves "
+             "~150 MB RAM if you only need SeeTrue gaze data.")
+    parser.add_argument("--no-display", action="store_true",
+        help="Run gesture/webcam workers headless — skip cv2.imshow windows.")
+    parser.add_argument("--bind", action="store_true",
+        help="Bind ZMQ sockets locally (0.0.0.0) instead of connecting to "
+             "remote_ip. Use this when SeeTrue PUSHes to the laptop.")
+    parser.add_argument("--simulator", action="store_true",
+        help="Shortcut for testing: forces remote_ip=127.0.0.1 (use alongside "
+             "python ../gaze_data_simulator/simulator.py).")
+    parser.add_argument("--no-auto-start", action="store_true",
+        help="Skip the UDP handshake (sendEyeTrackerTypeData + setEyeTrackerDevice "
+             "+ runPictureProcessing). Käytä jos SeeTrueTechLauncher on jo "
+             "käynnistänyt streamin.")
+    parser.add_argument("--device", default=None,
+        help="Force a specific eyeTrackerType id (skip auto-discovery during "
+             "handshake). Esim. --device EyeTrackerNetwork")
     args = parser.parse_args()
 
-    gesture_q = mpr.Queue(maxsize=64)
-    proc = mpr.Process(target=gesture_worker, args=(args.remote_ip, gesture_q),
-                       daemon=True)
-    proc.start()
-    print(f"[Bridge] gesture worker pid={proc.pid}")
+    if args.simulator:
+        args.remote_ip = "127.0.0.1"
 
-    # Webcam worker (face expression + secondary hand tracking)
-    cam_proc = mpr.Process(target=webcam_worker, args=(gesture_q, 0),
+    show_window = not args.no_display
+    bind_mode   = bool(args.bind)
+    auto_start  = not args.no_auto_start and not args.simulator and not bind_mode
+
+    # ── Banner ───────────────────────────────────────────────────────────────
+    direction_gaze  = (f"bind   tcp://0.0.0.0:{GAZE_PORT}"  if bind_mode
+                       else f"connect tcp://{args.remote_ip}:{GAZE_PORT}")
+    direction_scene = (f"bind   tcp://0.0.0.0:{SCENE_PORT}" if bind_mode
+                       else f"connect tcp://{args.remote_ip}:{SCENE_PORT}")
+    gesture_state = "off" if args.no_gesture else ("on (window)" if show_window else "on (headless)")
+    webcam_state  = "off" if not args.enable_webcam else ("on (window)" if show_window else "on (headless)")
+    print("=" * 64)
+    print("  bridge.py  ·  SeeTrue ↔ WebSocket fusion")
+    print(f"  ZMQ gaze:   {direction_gaze}")
+    print(f"  ZMQ scene:  {direction_scene}")
+    print(f"  Workers:    gesture={gesture_state}  webcam={webcam_state}")
+    print(f"  WebSocket:  ws://{WS_HOST}:{WS_PORT}")
+    print(f"  Auto-start: {'YES (UDP handshake)' if auto_start else 'no'}")
+    if not args.simulator and not bind_mode:
+        print("  Hint: jos hiljaisuus jatkuu yli 5s — kokeile --bind tai --simulator")
+    print("=" * 64)
+
+    # ── Pre-flight: voiko remote_ip:tä edes pingata? ────────────────────────
+    # Säästää käyttäjältä minuutin "still waiting" -lokia kun verkko on rikki.
+    if not bind_mode and not args.simulator:
+        import subprocess as _sp
+        try:
+            r = _sp.run(["ping", "-n", "1", "-w", "800", args.remote_ip],
+                        capture_output=True, text=True, timeout=3)
+            reachable = ("TTL=" in r.stdout) or ("ttl=" in r.stdout.lower())
+        except Exception:
+            reachable = False
+        if not reachable:
+            print(f"[preflight] ⚠ {args.remote_ip} EI VASTAA pingiin.")
+            print(f"[preflight]   Laptop on todennäköisesti eri verkossa kuin SeeTrue-server.")
+            print(f"[preflight]   Tarkista: ipconfig | findstr IPv4")
+            print(f"[preflight]   Vinkkejä:")
+            print(f"[preflight]     · liity samaan WiFiin/hotspotiin missä SeeTrue-kone on")
+            print(f"[preflight]     · jos server on samassa LANissa, etsi sen IP arp -a:lla")
+            print(f"[preflight]     · simulaattoritesti: --simulator (toiseen termiin simulator.py)")
+            print(f"[preflight]   Bridge jatkaa silti — voit pysäyttää Ctrl+C:llä.\n")
+        else:
+            print(f"[preflight] ✓ {args.remote_ip} vastaa pingiin")
+
+    # ── UDP handshake: tell SeeTrueEyeServer to start streaming ─────────────
+    # Tämä korvaa SeeTrueTechLauncherin tekemän alustusvaiheen. Ilman tätä ZMQ
+    # portit pysyvät hiljaa vaikka server pyörii.
+    if auto_start:
+        try:
+            kick_seetrue_stream(args.remote_ip, prefer_device=args.device)
+        except Exception as exc:
+            print(f"[handshake] FAILED: {exc} — jatketaan, mutta data ei ehkä virtaa")
+
+    gesture_q = mpr.Queue(maxsize=64)
+    gaze_q    = mpr.Queue(maxsize=512)
+
+    # Gaze worker AINA päällä — SeeTrue-data on bridgen pääfunktio
+    gaze_proc = mpr.Process(target=gaze_worker,
+                            args=(args.remote_ip, gaze_q, bind_mode),
+                            daemon=True)
+    gaze_proc.start()
+    print(f"[Bridge] gaze worker pid={gaze_proc.pid}")
+
+    if not args.no_gesture:
+        proc = mpr.Process(target=gesture_worker,
+                           args=(args.remote_ip, gesture_q, bind_mode, show_window),
                            daemon=True)
-    cam_proc.start()
-    print(f"[Bridge] webcam worker pid={cam_proc.pid}")
+        proc.start()
+        print(f"[Bridge] gesture worker pid={proc.pid}")
+    else:
+        print("[Bridge] gesture worker disabled (--no-gesture)")
+
+    if args.enable_webcam:
+        cam_proc = mpr.Process(target=webcam_worker,
+                               args=(gesture_q, 0, show_window),
+                               daemon=True)
+        cam_proc.start()
+        print(f"[Bridge] webcam worker pid={cam_proc.pid}")
+    else:
+        print("[Bridge] webcam worker disabled (use --enable-webcam to opt in)")
 
     server = await serve(ws_handler, WS_HOST, WS_PORT)
     print(f"[WS] listening on ws://{WS_HOST}:{WS_PORT}")
     await asyncio.gather(
         server.wait_closed(),
-        gaze_loop(args.remote_ip),
+        gaze_relay(gaze_q),
         gesture_relay(gesture_q),
+        heartbeat_loop(),
     )
 
 
