@@ -64,6 +64,30 @@
   box-shadow: 0 0 12px currentColor;
 }
 
+/* Pre-action progress indicator — kasvaa dwellin aikana ennen skipiä */
+#__d-shorts .__d-shorts-pre {
+  position: absolute; left: -3px; right: -3px; bottom: 0;
+  width: 0%;
+  height: 14px;
+  background: linear-gradient(90deg, transparent, #ff4d6d 60%, #ff4d6d);
+  border-radius: 2px;
+  opacity: 0;
+  transition: width .12s linear, opacity .15s;
+  box-shadow: 0 0 12px #ff4d6d, inset 0 0 6px rgba(255,255,255,.3);
+  pointer-events: none;
+}
+
+/* Modalities-rivi: pieni teksti listä joka näyttää mitkä signaalit triggaavat */
+#__d-shorts .__d-shorts-mods {
+  font-size: 8px; opacity: .55; flex-wrap: wrap;
+  max-width: 180px; line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+#__d-shorts .__d-shorts-mods .__ds-mod-hot {
+  color: #ff4d6d; font-weight: 700; opacity: 1;
+  text-shadow: 0 0 4px rgba(255,77,109,.6);
+}
+
 #__d-shorts .__d-shorts-info {
   display: flex; flex-direction: column; gap: 4px; min-width: 90px;
 }
