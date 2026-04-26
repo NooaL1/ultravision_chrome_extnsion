@@ -255,10 +255,16 @@ async def broadcast_to_others(msg: str, sender):
 # data koskaan saavu vaikka connect onnistuu. simple_gaze_receiverin pattern
 # (sync ZMQ erillisessä prosessissa, blocking recv) toimii varmasti — käytetään
 # sitä ja relayataan parsittu data multiprocessing.Queue:n kautta asyncio-puolelle.
-def gaze_worker(remote_ip: str, gaze_q, bind_mode: bool = False):
+def gaze_worker(remote_ip: str, gaze_q, bind_mode: bool = False,
+                gaze_shared=None):
     """Subprocess: sync zmq.PULL → parse → push to gaze_q.
     Sama tapa kuin simple_gaze_receiver/EyeTrackingReceiver mutta ilman
-    shared_data-kerrosta — vain raaka relay."""
+    shared_data-kerrosta — vain raaka relay.
+
+    gaze_shared: valinnainen mp.Array('d', 5) jaettu muisti
+        [gx, gy, pupilL, pupilR, ts]. gesture_worker (tai mikä tahansa
+        muu prosessi) lukee siitä uusimman gaze-pisteen reaaliajassa,
+        ilman msg-passing-overheadia, ja piirtää sen scene-cam-ikkunaan."""
     import zmq as zmq_local
     ctx  = zmq_local.Context()
     sock = ctx.socket(zmq_local.PULL)
@@ -331,6 +337,17 @@ def gaze_worker(remote_ip: str, gaze_q, bind_mode: bool = False):
             }
             if msg_count <= 3 or msg_count % 500 == 0:
                 print(f"[ZMQ] gaze parsed #{msg_count}: {data}")
+            # Päivitä shared memory jotta gesture_worker / scene-viewer voi
+            # piirtää gaze-pisteen reaaliajassa ilman msg-passingia.
+            if gaze_shared is not None:
+                try:
+                    gaze_shared[0] = data["gx"]
+                    gaze_shared[1] = data["gy"]
+                    gaze_shared[2] = data["pupilL"]
+                    gaze_shared[3] = data["pupilR"]
+                    gaze_shared[4] = time.time()
+                except Exception:
+                    pass
             try:
                 gaze_q.put_nowait(data)
             except Exception:
@@ -363,7 +380,7 @@ async def gaze_relay(q):
 
 # ── Gesture worker subprocess (cv2.imshow safe in main thread) ──────────────
 def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
-                   show_window: bool = True):
+                   show_window: bool = True, gaze_shared=None):
     """Runs in its own process so cv2.imshow + cv2.waitKey work properly.
 
     Tämä prosessi:
@@ -402,6 +419,12 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
     if show_window:
         cv.namedWindow("Gesture debug", cv.WINDOW_NORMAL)
         cv.resizeWindow("Gesture debug", 800, 600)
+        # ÄLÄ pelkästään näytä eleitä — avaa myös ISO scene-cam-ikkuna jossa
+        # näkyy lasit-kameran kuva + gaze-piste reaaliajassa. Tämä on demoa
+        # varten huomattavasti sulavampi kuin Chrome-paneelin scene-view koska
+        # ei msg-passing-overheadia. Natiivi-fps (~30 fps).
+        cv.namedWindow("Lasien kamera + gaze", cv.WINDOW_NORMAL)
+        cv.resizeWindow("Lasien kamera + gaze", 960, 720)
 
     last_swipe_ts    = 0.0
     last_swipe_label = ""
@@ -456,23 +479,30 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
         hand_ok = results is not None and results.multi_hand_landmarks
 
         # ── Stream pieni scene-frame Daemon HUDille ──────────────────────
-        # Joka 3. kuva (10 fps): downscale 240x180, JPEG q60, base64.
-        # Daemon piirtää tämän + gaze-pisteen päälle, niin näet
-        # chrome-laajennuksessa "mitä lasit näkevät juuri nyt + missä
-        # katseesi on". Bandwidth ~80 KB/s — sopiva WebSocketille.
-        if frame_idx % 3 == 0:
+        # Joka 2. kuva (~15 fps), 320×240 JPEG q70.
+        # JSON-relayn ja Chrome-extensionin msg-passingin overhead on iso
+        # kun viesti on isohko base64. Aiempi 240x180 + 10 fps näytti
+        # silti ~10 fpm — ongelma oli että payload uusiutui niin nopeasti
+        # ettei content-script ehtinyt purkaa Image:a. Nyt: korkeampi
+        # resoluutio (selvempi näkymä), q70 (parempi laatu pienissä
+        # muutoksissa) mutta lähetetään harvemmin (skipataan jos jonossa
+        # on jo data).
+        if frame_idx % 2 == 0:
             try:
-                small = cv.resize(img, (240, 180), interpolation=cv.INTER_AREA)
-                ok, buf = cv.imencode(".jpg", small,
-                                      [cv.IMWRITE_JPEG_QUALITY, 60])
-                if ok:
-                    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-                    gesture_q.put_nowait({
-                        "source": "ovision-scene",
-                        "ts": now,
-                        "w": 240, "h": 180,
-                        "jpeg": b64,
-                    })
+                # Skippaa jos jono on lähes täynnä — vältetään kasaantuminen
+                if gesture_q.qsize() < 32:
+                    small = cv.resize(img, (320, 240),
+                                      interpolation=cv.INTER_AREA)
+                    ok, buf = cv.imencode(".jpg", small,
+                                          [cv.IMWRITE_JPEG_QUALITY, 70])
+                    if ok:
+                        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                        gesture_q.put_nowait({
+                            "source": "ovision-scene",
+                            "ts": now,
+                            "w": 320, "h": 240,
+                            "jpeg": b64,
+                        })
             except Exception:
                 pass
 
@@ -609,6 +639,49 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
 
         if show_window:
             cv.imshow("Gesture debug", img)
+
+            # ── Scene-cam + gaze overlay -ikkuna ─────────────────────────
+            # Käyttää alkuperäistä isoa scene-frameä (640x480 tai mitä
+            # SeeTrue lähettää), piirtää siihen gaze-pisteen shared
+            # memorystä. Natiivi-fps, paljon sulavampi kuin Chrome-panelissa.
+            scene_disp = img.copy()
+            sH, sW = scene_disp.shape[:2]
+            gx_norm = gy_norm = pup_l = pup_r = 0.0
+            gaze_age = 99.0
+            if gaze_shared is not None:
+                try:
+                    gx_norm = float(gaze_shared[0])
+                    gy_norm = float(gaze_shared[1])
+                    pup_l   = float(gaze_shared[2])
+                    pup_r   = float(gaze_shared[3])
+                    gaze_age = max(0.0, time.time() - float(gaze_shared[4]))
+                except Exception:
+                    pass
+            if gaze_age < 1.0 and 0.0 <= gx_norm <= 1.0 and 0.0 <= gy_norm <= 1.0:
+                gx_px = int(gx_norm * sW)
+                gy_px = int(gy_norm * sH)
+                # Iso pinkki risti + ympyrä
+                cv.circle(scene_disp, (gx_px, gy_px), 26, (90, 60, 255), 3, cv.LINE_AA)
+                cv.circle(scene_disp, (gx_px, gy_px), 12, (130, 110, 255), 2, cv.LINE_AA)
+                cv.line(scene_disp, (gx_px - 40, gy_px), (gx_px - 14, gy_px),
+                        (130, 110, 255), 2, cv.LINE_AA)
+                cv.line(scene_disp, (gx_px + 14, gy_px), (gx_px + 40, gy_px),
+                        (130, 110, 255), 2, cv.LINE_AA)
+                cv.line(scene_disp, (gx_px, gy_px - 40), (gx_px, gy_px - 14),
+                        (130, 110, 255), 2, cv.LINE_AA)
+                cv.line(scene_disp, (gx_px, gy_px + 14), (gx_px, gy_px + 40),
+                        (130, 110, 255), 2, cv.LINE_AA)
+                cv.circle(scene_disp, (gx_px, gy_px), 3, (255, 255, 255), -1, cv.LINE_AA)
+                cv.putText(scene_disp,
+                           f"pup L {pup_l:.2f}  R {pup_r:.2f}  age {gaze_age*1000:.0f}ms",
+                           (12, sH - 16),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 2, cv.LINE_AA)
+            else:
+                cv.putText(scene_disp, "no gaze (lasit ei lukitse silmia)",
+                           (12, sH - 16),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 255), 2, cv.LINE_AA)
+            cv.imshow("Lasien kamera + gaze", scene_disp)
+
             if cv.waitKey(1) & 0xFF == ord("q"):
                 break
         else:
@@ -910,16 +983,22 @@ async def main():
     gesture_q = mpr.Queue(maxsize=64)
     gaze_q    = mpr.Queue(maxsize=512)
 
+    # Shared memory live gaze:lle (gx, gy, pupilL, pupilR, ts).
+    # gaze_worker kirjoittaa, gesture_worker lukee ja piirtää scene-cam-
+    # ikkunaan. Kevyt mp.Array — ei lockia, pieni racing OK visualisointiin.
+    gaze_shared = mpr.Array("d", [0.0, 0.0, 0.0, 0.0, 0.0])
+
     # Gaze worker AINA päällä — SeeTrue-data on bridgen pääfunktio
     gaze_proc = mpr.Process(target=gaze_worker,
-                            args=(args.remote_ip, gaze_q, bind_mode),
+                            args=(args.remote_ip, gaze_q, bind_mode, gaze_shared),
                             daemon=True)
     gaze_proc.start()
     print(f"[Bridge] gaze worker pid={gaze_proc.pid}")
 
     if not args.no_gesture:
         proc = mpr.Process(target=gesture_worker,
-                           args=(args.remote_ip, gesture_q, bind_mode, show_window),
+                           args=(args.remote_ip, gesture_q, bind_mode,
+                                 show_window, gaze_shared),
                            daemon=True)
         proc.start()
         print(f"[Bridge] gesture worker pid={proc.pid}")

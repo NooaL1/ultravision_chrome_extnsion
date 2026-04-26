@@ -146,10 +146,22 @@ setInterval(() => {
   }
 }, 1000);
 
+// Lähetä scene-cam-kuva VAIN kun se on UUSI — muuten emit-tickit kuljettavat
+// turhaan saman ison base64-payloadin chromen msg-channelin yli ja browser
+// ruuhkautuu. Pidetään kirjaa siitä, mitä viimeksi lähetettiin.
+let _lastEmittedSceneTs = 0;
 function emitOvisionTick() {
   // Forward latest Ovision snapshot to consumers (HUD, shorts) at 10 Hz.
   if (!lastOvision.gaze && !lastOvision.pupil && !lastOvision.gesture
       && !lastOvision.face && !lastOvision.bridge && !fusionConnected) return;
+
+  // Sisällytä scene vain jos se on uusi — säästää bandwidthia 90 %.
+  let sceneToSend = null;
+  if (lastOvision.scene && lastOvision.scene.ts !== _lastEmittedSceneTs) {
+    sceneToSend = lastOvision.scene;
+    _lastEmittedSceneTs = lastOvision.scene.ts;
+  }
+
   const out = { ovision: {
     pupil: lastOvision.pupil,
     gaze: lastOvision.gaze ? { gx: lastOvision.gaze.gx,
@@ -160,7 +172,7 @@ function emitOvisionTick() {
     fixDwellMs: lastOvision.fixDwellMs,
     face: lastOvision.face,
     bridge: lastOvision.bridge,
-    scene: lastOvision.scene,   // SeeTrue scene-cam dataURL + gaze overlays content-side
+    scene: sceneToSend,    // null jos ei uutta, muuten {dataUrl,w,h,ts}
     connected: fusionConnected,
   }};
   _emitCount++;
@@ -391,12 +403,10 @@ function loop() {
     const r = landmarker.detectForVideo(video, performance.now());
     if (r.faceLandmarks && r.faceLandmarks.length > 0) {
       roi = computeForeheadROI(r.faceLandmarks[0], sample.width, sample.height);
-      // Renderöi pieni webkameran preview + face-mesh overlay HUDille.
-      // Tämä näkee Daemonin paneelissa "tämä on sinä, tällä kohden Daemon
-      // näkee kasvosi" — tehokas visuaalinen vahvistus että se toimii.
-      if (frame % 3 === 0) {
-        renderWebcamPreview(r.faceLandmarks[0]);
-      }
+      // Cache uusimmat landmarkit, mutta itse preview piirtyy ALLA aina —
+      // näin webkameran kuva päivittyy jokaisella loop-iteraatiolla
+      // (~30 Hz target, todellisuudessa 5–15 fps CPU:n mukaan).
+      _lastFaceLandmarks = r.faceLandmarks[0];
     }
     // Pään asento — joka frame, kevyt
     if (r.facialTransformationMatrixes && r.facialTransformationMatrixes.length > 0) {
@@ -437,9 +447,21 @@ function loop() {
     send({ face: false });
   }
 
+  // Webkameran preview — JOKA framella jotta video näyttää sulavalta.
+  // MediaPipe-landmarkit cachataan _lastFaceLandmarks:iin (ne päivittyvät
+  // hitaammin, mutta video-kuva ei jää jumiin niiden vuoksi).
+  if (frame % 2 === 0) {   // ~15 fps preview update — riittävä, säästää CPU:ta
+    renderWebcamPreview(_lastFaceLandmarks);
+  }
+
   frame++;
   scheduleNext();
 }
+
+// Cachattu uusin face-mesh landmark-array. renderWebcamPreview piirtää
+// ne preview-canvasille reaaliajassa, vaikka MediaPipe ei juuri nyt
+// laskisi uutta detektiota.
+let _lastFaceLandmarks = null;
 
 // Karkeat tunne-arviot blendshape-aktivaatioista. Palauttaa { label, score }.
 function inferEmotion(categories) {

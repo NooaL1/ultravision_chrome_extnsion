@@ -213,22 +213,26 @@
   }
 
   // ---- SeeTrue scene-cam rendering ----
-  // Bridge lähettää 240×180 JPEG/base64. Daemon offscreen forwardoi sen
-  // dataURL-muodossa. Lataamme sen <img>:hin ja piirrämme canvasille +
-  // gaze-pisteen päälle (lasien gx/gy on jo skaalattu 0..1 → carrying frame).
+  // Bridge lähettää JPEG/base64. Pidämme yhden Image-elementin ja vaihdamme
+  // sen src:n vain kun saamme uuden framen. Gaze-overlay piirretään aina
+  // uusiksi olipa frame uusi tai ei — gaze-piste päivittyy 50 Hz vaikka
+  // scene-frame tulee vain ~15 fps.
+  let _sceneLastGaze = null;
   function renderScene(scene, gaze) {
-    if (!scene || !scene.dataUrl) return;
-    if (scene.dataUrl !== _sceneLastUrl) {
+    if (gaze) _sceneLastGaze = gaze;
+    if (scene && scene.dataUrl && scene.dataUrl !== _sceneLastUrl) {
       _sceneLastUrl = scene.dataUrl;
-      _sceneImageReady = false;
       if (!_sceneImageEl) _sceneImageEl = new Image();
       _sceneImageEl.onload = () => {
         _sceneImageReady = true;
-        drawScene(_sceneImageEl, gaze);
+        drawScene(_sceneImageEl, _sceneLastGaze);
       };
       _sceneImageEl.src = scene.dataUrl;
-    } else if (_sceneImageReady) {
-      drawScene(_sceneImageEl, gaze);
+      return;
+    }
+    // Sama scene-frame kuin viime kerralla → vain re-paint gaze overlaylla
+    if (_sceneImageReady && _sceneImageEl) {
+      drawScene(_sceneImageEl, _sceneLastGaze);
     }
   }
   function drawScene(img, gaze) {
