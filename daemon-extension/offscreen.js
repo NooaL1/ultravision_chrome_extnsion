@@ -54,6 +54,44 @@ function fusionTickFromDaemon() {
   });
 }
 
+// ── Stream webkameran kuva bridgelle WS:n yli ──────────────────────────────
+// Bridge avaa cv2-ikkunan johon näyttää tämän streamin. Webkamera-contention
+// (Windows: kahden prosessin avata sama kamera) ratkeaa kun vain Daemonin
+// offscreen-Chrome omistaa kameran ja python näyttää sen lähetetyn datan.
+const _wcStreamCv = document.createElement('canvas');
+_wcStreamCv.width = 480; _wcStreamCv.height = 360;
+const _wcStreamCtx = _wcStreamCv.getContext('2d');
+let _wcStreamBusy = false;
+let _wcStreamLastT = 0;
+async function streamWebcamToBridge() {
+  if (!fusionConnected || !video || !video.videoWidth) return;
+  if (_wcStreamBusy) return;
+  const now = Date.now();
+  if (now - _wcStreamLastT < 100) return;   // ≤ 10 fps
+  _wcStreamLastT = now;
+  _wcStreamBusy = true;
+  try {
+    _wcStreamCtx.drawImage(video, 0, 0, _wcStreamCv.width, _wcStreamCv.height);
+    const blob = await new Promise(r => _wcStreamCv.toBlob(r, 'image/jpeg', 0.55));
+    if (!blob) { _wcStreamBusy = false; return; }
+    const ab = await blob.arrayBuffer();
+    const bytes = new Uint8Array(ab);
+    // base64-koodaa chunkeissa ettei stack-kaadu suurilla blobeilla
+    let bin = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    const b64 = btoa(bin);
+    fusionSend({ source: 'daemon-webcam', ts: now, w: 480, h: 360, jpeg: b64 });
+  } catch (e) {
+    // toBlob/arrayBuffer voi heittää jos canvas tyhjä — ohita
+  } finally {
+    _wcStreamBusy = false;
+  }
+}
+setInterval(streamWebcamToBridge, 120);  // tähtää ~8–10 fps
+
 function ingestOvisionMessage(obj) {
   if (!obj || typeof obj !== 'object') return;
   _fusionIngestCount++;

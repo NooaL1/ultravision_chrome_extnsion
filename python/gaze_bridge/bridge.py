@@ -96,6 +96,9 @@ DRAG_THRESHOLD    = 0.05    # min Δy normalisoitu jotta lasketaan swipeksi
 
 clients: set = set()
 
+# Webcam-stream Daemonilta bridgelle (ws_handler täyttää, display_worker lukee)
+webcam_disp_q = None  # asetetaan main()ssa, mp.Queue
+
 # SeeTrue liveness — gaze_loop päivittää, heartbeat_loop ja stdout lukevat.
 # time.monotonic() pohjainen jotta kellovaihdot eivät häiritse.
 last_gaze_ts: float = 0.0
@@ -224,7 +227,27 @@ async def ws_handler(ws):
             if inbound <= 3 or inbound % 200 == 0:
                 preview = raw if len(raw) < 160 else raw[:160] + "…"
                 print(f"[WS] inbound #{inbound}: {preview}")
-            await broadcast_to_others(raw, sender=ws)
+            # Sieppaa Daemonin webkamera-stream ennen broadcastia — purkaa
+            # JPEG-base64 ja työntää webcam-display-workerille jotta
+            # kamera näkyy cv2-ikkunassa. ÄLÄ broadcastaa edelleen — turhaa
+            # kuormaa muille clienteille.
+            handled = False
+            try:
+                if raw.startswith('{') and '"daemon-webcam"' in raw:
+                    import base64
+                    obj = json.loads(raw)
+                    if obj.get('source') == 'daemon-webcam' and obj.get('jpeg'):
+                        try:
+                            jpeg_bytes = base64.b64decode(obj['jpeg'])
+                            if webcam_disp_q is not None:
+                                webcam_disp_q.put_nowait(jpeg_bytes)
+                            handled = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if not handled:
+                await broadcast_to_others(raw, sender=ws)
     except Exception as exc:
         print(f"[WS] handler error: {exc}")
     finally:
@@ -676,7 +699,53 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
             time.sleep(0.001)
 
 
-# ── Webcam worker (face expression + secondary hand tracking) ──────────────
+# ── Webcam display worker — näyttää Daemonin lähettämän kameravirran ───────
+# Vältämme webkamera-contentionin: Windows ei salli kahden prosessin avata
+# samaa kameraa luotettavasti, ja Daemon tarvitsee sen rPPG-sykkeeseen.
+# Daemonin offscreen.js encodaa kameransa JPEG:nä ja lähettää sen WebSocketin
+# yli (source='daemon-webcam'). Tämä worker vain decodaa ja näyttää.
+def webcam_display_worker(webcam_q):
+    """Reads JPEG bytes from queue (filled by ws_handler from incoming WS
+    messages with source='daemon-webcam') and shows them in cv2.imshow."""
+    import cv2 as cv
+    import numpy as np
+    cv.namedWindow("Webcam (Daemonin lähetys)", cv.WINDOW_NORMAL)
+    cv.resizeWindow("Webcam (Daemonin lähetys)", 700, 525)
+    print("[WebcamDisp] subprocess started — odottaa Daemonin streamia")
+    last_frame_t = 0.0
+    while True:
+        try:
+            jpeg = webcam_q.get(timeout=0.5)
+        except Exception:
+            # Ei dataa — näytä placeholder
+            placeholder = np.zeros((525, 700, 3), dtype=np.uint8)
+            cv.putText(placeholder,
+                       "Odotetaan Daemonin webcam-streamia...",
+                       (40, 250), cv.FONT_HERSHEY_SIMPLEX, 0.7,
+                       (180, 180, 180), 2, cv.LINE_AA)
+            cv.putText(placeholder,
+                       "(Avaa Daemon Chromessa ja kaynnista engine)",
+                       (40, 290), cv.FONT_HERSHEY_SIMPLEX, 0.5,
+                       (120, 120, 120), 1, cv.LINE_AA)
+            cv.imshow("Webcam (Daemonin lähetys)", placeholder)
+            if cv.waitKey(1) & 0xFF == ord("q"):
+                break
+            continue
+        try:
+            arr = np.frombuffer(jpeg, dtype=np.uint8)
+            img = cv.imdecode(arr, cv.IMREAD_COLOR)
+            if img is None:
+                continue
+            cv.imshow("Webcam (Daemonin lähetys)", img)
+            last_frame_t = time.time()
+            if cv.waitKey(1) & 0xFF == ord("q"):
+                break
+        except Exception as exc:
+            print(f"[WebcamDisp] error: {exc}")
+    cv.destroyAllWindows()
+
+
+# ── Webcam worker (legacy: avaa oman kameran — käytä vain jos Daemon ei) ───
 def webcam_worker(gesture_q, cam_index=0, show_window: bool = True):
     """Reads laptop webcam → MediaPipe face mesh + hands. Pushes face
     expression metrics + (optional) gesture events into the queue.
@@ -973,6 +1042,11 @@ async def main():
     gesture_q = mpr.Queue(maxsize=64)
     gaze_q    = mpr.Queue(maxsize=512)
 
+    # Webcam-stream queue — Daemonin offscreen.js lähettää JPEG:n WS:n yli,
+    # ws_handler työntää ne tähän, webcam_display_worker näyttää ne cv2:lla.
+    global webcam_disp_q
+    webcam_disp_q = mpr.Queue(maxsize=8)
+
     # Shared memory live gaze:lle (gx, gy, pupilL, pupilR, ts).
     # gaze_worker kirjoittaa, gesture_worker lukee ja piirtää scene-cam-
     # ikkunaan. Kevyt mp.Array — ei lockia, pieni racing OK visualisointiin.
@@ -995,14 +1069,18 @@ async def main():
     else:
         print("[Bridge] gesture worker disabled (--no-gesture)")
 
-    if not args.no_webcam:
-        cam_proc = mpr.Process(target=webcam_worker,
-                               args=(gesture_q, 0, show_window),
+    if not args.no_webcam and show_window:
+        # webcam_display_worker EI avaa kameraa itse — se ottaa Daemonin
+        # WebSocketin yli streamaamia JPEG-frameja. Tämä välttää
+        # Windows-webkamera-contentionin (Daemonin getUserMedia ja python
+        # cv.VideoCapture eivät voi jakaa kameraa luotettavasti).
+        cam_proc = mpr.Process(target=webcam_display_worker,
+                               args=(webcam_disp_q,),
                                daemon=True)
         cam_proc.start()
-        print(f"[Bridge] webcam worker pid={cam_proc.pid} (toinen cv2-ikkuna)")
+        print(f"[Bridge] webcam display pid={cam_proc.pid} (näyttää Daemonin streamia)")
     else:
-        print("[Bridge] webcam worker disabled (--no-webcam)")
+        print("[Bridge] webcam display disabled (--no-webcam tai --no-display)")
 
     server = await serve(ws_handler, WS_HOST, WS_PORT)
     print(f"[WS] listening on ws://{WS_HOST}:{WS_PORT}")
