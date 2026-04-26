@@ -44,11 +44,15 @@
 }
 
 /* ===== big sci-fi panel ===== */
+/* Leveä, max 90vh korkea, sisältö skrollautuu pystyyn jos ei mahdu. */
 #__d-panel {
   all: initial;
   position: fixed; top: 12px; right: 12px; z-index: 2147483645;
-  width: 380px;
+  width: 760px;            /* oli 380 — kaksinkertaistettu */
+  max-width: 96vw;
+  max-height: 92vh;
   display: none;
+  flex-direction: column;
   background:
     linear-gradient(180deg, rgba(15,17,22,.95), rgba(8,10,14,.95)),
     repeating-linear-gradient(0deg, rgba(255,255,255,.015) 0px, rgba(255,255,255,.015) 1px, transparent 1px, transparent 3px);
@@ -65,7 +69,22 @@
   overflow: hidden;
   transition: opacity .2s;
 }
-#__d-panel.__d-open { display: block; }
+#__d-panel.__d-open { display: flex; }
+
+/* Grid skrollautuu kun cellit eivät mahdu pystyyn — handle ja foot pysyvät. */
+#__d-panel .__d-grid {
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1 1 auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(80,200,255,.4) rgba(255,255,255,.05);
+}
+#__d-panel .__d-grid::-webkit-scrollbar { width: 8px; }
+#__d-panel .__d-grid::-webkit-scrollbar-track { background: rgba(255,255,255,.03); }
+#__d-panel .__d-grid::-webkit-scrollbar-thumb {
+  background: rgba(80,200,255,.4);
+  border-radius: 4px;
+}
 
 /* corner brackets — pure sci-fi */
 #__d-panel .__d-corner {
@@ -97,9 +116,18 @@
 #__d-close:hover { background: rgba(80,200,255,.15); color: #fff; }
 
 #__d-panel .__d-grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  /* 3-saraketta — leveämpi paneli mahduttaa enemmän visuaalista dataa
+     samalle riville (CARDIO + ROI + WEBCAM), vähemmän pysty-skrollia. */
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
   padding: 10px 12px;
 }
+/* Wide-cells (kuvaajat, listat) levittäytyvät 2/3 saraketta jotta jää tilaa
+   pienille mittarisoluille. */
+#__d-panel .__d-wide { grid-column: span 3; }
+/* Erikois: webkamera ja lasien kamera saavat oman 2-sarake-leveyden,
+   jolloin ne näkyvät rinnakkain ja niiden viereen mahtuu jotain muuta. */
+#__d-panel #__d-webcam-cell { grid-column: span 1; }
+#__d-panel #__d-scene-cell  { grid-column: span 2; }
 #__d-panel .__d-cell {
   display: flex; flex-direction: column; gap: 4px;
   padding: 6px 8px;
