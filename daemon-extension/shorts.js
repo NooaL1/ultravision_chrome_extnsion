@@ -395,24 +395,22 @@
 
   // ── Herkkyysliuku säätää aggressiivisuutta — algoritmin rakenne pysyy samana
   // Liuku 0   = kärsivällinen: vaaditaan 2 modaliteettia + iso z-margin + pitkä dwell
-  // Liuku 50  = balanced (oletus)
-  // Liuku 100 = aggressiivinen: 1 selkeän signaalin (esim. katse pois) pieni
-  //            nykäys riittää, dwell vain ~700 ms — skippaa heti kun mikä
-  //            tahansa tylsyyssignaali ylittää käyttäjän baselinen.
+  // Liuku 50  = balanced
+  // Liuku 70+ = trigger-happy: yksi signaali riittää, ei confidence flooria
+  // Liuku 100 = trigger-instant: skippaa AINOASTAAN ENSIMMÄISEN merkin tylsyydestä
+  //             dwell ~250 ms, pre-action 50 ms, min video 100 ms — käytännössä
+  //             reagoi heti kun pupilli laskee tai katse karkaa.
   function tunings() {
     const t = sensitivity / 100;   // 0 = patient, 1 = aggressive
     return {
-      T_high:    0.65 - t * 0.55,         // 0.65 .. 0.10 z-space
-      T_low:     0.35 - t * 0.30,         // 0.35 .. 0.05
-      dwellMs:   1500 - t * 800,          // 1500 ms .. 700 ms
-      preStartMs: Math.max(150, 700 - t * 550), // 700 ms .. 150 ms
-      minVideoMs: Math.max(400, 2500 - t * 2100), // 2500 ms .. 400 ms
-      // Tarvittavat samanaikaisesti aktiiviset modaliteetit (multi-modal AND-gate):
+      T_high:    0.65 - t * 0.65,                  // 0.65 .. 0.00 z-space
+      T_low:     0.35 - t * 0.35,                  // 0.35 .. 0.00
+      dwellMs:   Math.max(250, 1500 - t * 1250),   // 1500 ms .. 250 ms
+      preStartMs: Math.max(50,  700  - t * 650),   // 700 ms  .. 50 ms
+      minVideoMs: Math.max(100, 2500 - t * 2400),  // 2500 ms .. 100 ms
       reqAboveHigh: t < 0.33 ? 2 : 1,
-      // Confidence floor: signaalit joiden |z| >= 0.5
-      reqSignals:   t < 0.50 ? 2 : 1,
-      // Skip-cap (osuus videoista joita saa skipata sessiossa):
-      skipCap:      0.25 + t * 0.55,      // 0.25 .. 0.80
+      reqSignals:   t > 0.70 ? 0 : (t < 0.50 ? 2 : 1),  // >70 = ei confidence flooria
+      skipCap:      Math.min(1.0, 0.25 + t * 0.85),     // 0.25 .. 1.00 (cap pois max:lla)
     };
   }
 

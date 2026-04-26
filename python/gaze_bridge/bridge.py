@@ -240,6 +240,11 @@ async def ws_handler(ws):
                         try:
                             jpeg_bytes = base64.b64decode(obj['jpeg'])
                             if webcam_disp_q is not None:
+                                # Drop-oldest: jos jono täynnä, tyhjennä ennen
+                                # putia jotta uusin frame voittaa
+                                while webcam_disp_q.full():
+                                    try: webcam_disp_q.get_nowait()
+                                    except Exception: break
                                 webcam_disp_q.put_nowait(jpeg_bytes)
                             handled = True
                         except Exception:
@@ -706,42 +711,65 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
 # yli (source='daemon-webcam'). Tämä worker vain decodaa ja näyttää.
 def webcam_display_worker(webcam_q):
     """Reads JPEG bytes from queue (filled by ws_handler from incoming WS
-    messages with source='daemon-webcam') and shows them in cv2.imshow."""
+    messages with source='daemon-webcam') and shows them in cv2.imshow.
+
+    Vältetään välkkyminen: pidetään edellinen frame näkyvissä siihen asti
+    kunnes uusi saapuu. Placeholder vain ENSIMMÄISEN streamin saapuessa
+    ja sitten vasta kun stream on ollut hiljaa >5 sekuntia.
+    """
     import cv2 as cv
     import numpy as np
     cv.namedWindow("Webcam (Daemonin lähetys)", cv.WINDOW_NORMAL)
     cv.resizeWindow("Webcam (Daemonin lähetys)", 700, 525)
     print("[WebcamDisp] subprocess started — odottaa Daemonin streamia")
-    last_frame_t = 0.0
+    last_img = None        # viimeisin onnistunut decode
+    last_frame_t = 0.0     # time.time() kun viimeisin frame näytettiin
+    show_placeholder = True
+
+    def _draw_placeholder():
+        ph = np.zeros((525, 700, 3), dtype=np.uint8)
+        cv.putText(ph, "Odotetaan Daemonin webcam-streamia...",
+                   (40, 250), cv.FONT_HERSHEY_SIMPLEX, 0.7,
+                   (180, 180, 180), 2, cv.LINE_AA)
+        cv.putText(ph, "(Avaa Daemon Chromessa ja kaynnista engine)",
+                   (40, 290), cv.FONT_HERSHEY_SIMPLEX, 0.5,
+                   (120, 120, 120), 1, cv.LINE_AA)
+        return ph
+
     while True:
+        # Drainaa jonossa olevat framet ja pidä uusin (älä jää jälkeen)
+        latest_jpeg = None
         try:
-            jpeg = webcam_q.get(timeout=0.5)
+            latest_jpeg = webcam_q.get(timeout=0.05)
+            # Ota nopeasti loputkin jos niitä on
+            while True:
+                latest_jpeg = webcam_q.get_nowait()
         except Exception:
-            # Ei dataa — näytä placeholder
-            placeholder = np.zeros((525, 700, 3), dtype=np.uint8)
-            cv.putText(placeholder,
-                       "Odotetaan Daemonin webcam-streamia...",
-                       (40, 250), cv.FONT_HERSHEY_SIMPLEX, 0.7,
-                       (180, 180, 180), 2, cv.LINE_AA)
-            cv.putText(placeholder,
-                       "(Avaa Daemon Chromessa ja kaynnista engine)",
-                       (40, 290), cv.FONT_HERSHEY_SIMPLEX, 0.5,
-                       (120, 120, 120), 1, cv.LINE_AA)
-            cv.imshow("Webcam (Daemonin lähetys)", placeholder)
-            if cv.waitKey(1) & 0xFF == ord("q"):
-                break
-            continue
-        try:
-            arr = np.frombuffer(jpeg, dtype=np.uint8)
-            img = cv.imdecode(arr, cv.IMREAD_COLOR)
-            if img is None:
-                continue
-            cv.imshow("Webcam (Daemonin lähetys)", img)
-            last_frame_t = time.time()
-            if cv.waitKey(1) & 0xFF == ord("q"):
-                break
-        except Exception as exc:
-            print(f"[WebcamDisp] error: {exc}")
+            pass
+
+        if latest_jpeg is not None:
+            try:
+                arr = np.frombuffer(latest_jpeg, dtype=np.uint8)
+                img = cv.imdecode(arr, cv.IMREAD_COLOR)
+                if img is not None:
+                    last_img = img
+                    last_frame_t = time.time()
+                    show_placeholder = False
+            except Exception as exc:
+                print(f"[WebcamDisp] decode error: {exc}")
+
+        now = time.time()
+        # Päätä mitä näytetään tässä iteraatiossa
+        if last_img is not None and (now - last_frame_t) < 5.0:
+            cv.imshow("Webcam (Daemonin lähetys)", last_img)
+        else:
+            if last_img is not None and not show_placeholder:
+                show_placeholder = True
+                print(f"[WebcamDisp] stream stale {now-last_frame_t:.1f}s — placeholder")
+            cv.imshow("Webcam (Daemonin lähetys)", _draw_placeholder())
+
+        if cv.waitKey(1) & 0xFF == ord("q"):
+            break
     cv.destroyAllWindows()
 
 
