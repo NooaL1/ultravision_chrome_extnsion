@@ -1,25 +1,63 @@
-# bridge.py
+# bridge.py — SeeTrue ↔ WebSocket-silta + käsi-eleentunnistus
 """
-Bridges SeeTrue eye-tracker ZMQ stream to a local WebSocket so a
-Chrome extension can read gaze + pupil data, plus runs MediaPipe
-hand-tracking on the scene-cam feed in a separate process so the
-cv2.imshow window works reliably on Windows.
+=============================================================================
+  Mitä tämä tiedosto on
+=============================================================================
+Tämä on SILTA SeeTrue-silmänseurantalasien ja Daemon-Chrome-laajennuksen
+välillä. SeeTrue-lasit ovat järjestelmän PÄÄSIGNAALI:
+    · katseen koordinaatit (gx, gy)
+    · pupillin koko vasemmalle ja oikealle silmälle (mm)
+    · sakkadit, fixationit, blinkit
+    · scene-kameran video (lasien etupuolelta) → käsieleet
 
-Common setups
--------------
-Hackathon kit (SeeTrue oletus 172.20.10.3, connect-tila):
+Kaikki tämä virtaa ZMQ:n yli SeeTruen omasta serveriohjelmasta
+(SeeTrueEyeServer.exe) bridgeen, joka:
+    1. Käynnistää datavirran lähettämällä UDP-handshakean serverille
+       (sendEyeTrackerTypeData → setEyeTrackerDevice → runPictureProcessing)
+    2. Vastaanottaa ZMQ-viestit erillisessä Python-aliprosessissa
+       (välttäen Windowsin asyncio + zmq.asyncio -ristiriidan)
+    3. Ajaa MediaPipe Hands -käsiraajamallia scene-kameran framessa
+       ja tunnistaa pinch-grab + drag -liikkeitä SWIPE-tapahtumiksi
+    4. Tarjoaa kaiken WebSocket-clienteille porttiin ws://localhost:8765
+    5. Lähettää 1 Hz heartbeatin jotta clientit tietävät onko data elossa
+
+Daemon-laajennus (daemon-extension/) yhdistyy tähän, ottaa SeeTruen datan,
+yhdistää sen omaan webkameran rPPG + tunne-analyysiin, ja päättelee siitä
+tulisiko YouTube Shorts skipata.
+
+=============================================================================
+  Tyypilliset käynnistystavat
+=============================================================================
+SeeTrue-laitteen kanssa (oletus IP 172.20.10.3, connect-tila):
     python bridge.py
-Eri IP:
-    python bridge.py --remote_ip 192.168.10.201
-Reverse direction — SeeTrue PUSHaa laptopille (laptop bindaa porttiin):
+
+Jos SeeTruen IP on eri:
+    python bridge.py --remote_ip 192.168.X.Y
+
+Jos SeeTrue PUSHaa lapotpiisi (laptop bindaa porttiin):
     python bridge.py --bind
-Ei laitetta, käytä simulaattoria (aja toisessa terminaalissa
-gaze_data_simulator/simulator.py):
+
+Ilman laitteistoa, simulaattorilla (kahdessa terminaalissa):
+    python ../gaze_data_simulator/simulator.py
     python bridge.py --simulator
-Kevyt RAM-profiili demoon (oletus jo no-webcam, lisätään headless):
+
+Demoa varten (kevyt RAM, ei cv2-ikkunoita):
     python bridge.py --no-display
-Älä lataa MediaPipea ollenkaan (vain WebSocket-bridge SeeTrue-datalle):
-    python bridge.py --no-gesture
+
+=============================================================================
+  Mitä lokissa pitäisi näkyä kun kaikki toimii
+=============================================================================
+    [preflight] ✓ 172.20.10.3 vastaa pingiin
+    [handshake] kicking SeeTrueEyeServer at 172.20.10.3:3429
+    [handshake] → UDP {'action': 'sendEyeTrackerTypeData'}
+    [handshake] → UDP {'action': 'runPictureProcessing', ...}
+    [ZMQ] gaze parsed #1: {pupilL: 2.84, pupilR: 4.19, ...}   ← lasit syöttävät
+    [Gesture] frame #1 (188 KB)                               ← scene-kamera
+    [WS] client connected                                     ← Daemon yhdistyi
+    [WS] inbound #1: {"source":"daemon", "bpm": 65, ...}      ← Daemon syöttää HR
+
+Jos näet "still waiting for first gaze sample" → SeeTrue ei lähetä dataa.
+Tarkista IP, verkko, ja että SeeTrueEyeServer on käynnistetty laitteella.
 """
 
 import argparse
@@ -42,11 +80,19 @@ WS_PORT       = 8765
 GAZE_PORT     = 3428
 SCENE_PORT    = 3425
 
-SWIPE_COOLDOWN_S  = 0.7
-PROCESS_EVERY_NTH = 1
-PINCH_ON_DIST     = 0.06    # finger-tip distance (norm) below this = pinched
-PINCH_OFF_DIST    = 0.10    # release threshold (hysteresis)
-DRAG_THRESHOLD    = 0.10    # min Δy during pinch to count as a swipe
+# ── Hand-swipe-asetukset (SeeTruen scene-kameran kuva) ──────────────────────
+# Käyttäjä tekee "pinch-grab" (peukalo + etusormi yhteen) ja vetää joko
+# ylös tai alas. Kun pinch vapautuu, lasketaan Δy ja jos se ylittää
+# DRAG_THRESHOLD, lähetetään SWIPE-tapahtuma. Kynnykset on tuunattu siten
+# että pienikin selvä nykäys riittää — käyttäjä haluaa ohjata Shortsia
+# nopeasti edestakaisin lasit päässä.
+SWIPE_COOLDOWN_S  = 0.4     # min aika kahden swipen välillä (oli 0.7 — tehty herkemmäksi)
+PROCESS_EVERY_NTH = 1       # 1 = jokainen frame, kasvata jos CPU rajoittaa
+PINCH_ON_DIST     = 0.06    # peukalo+etusormi alle tämän = grab alkaa
+PINCH_OFF_DIST    = 0.10    # vapautus-kynnys (hysteresis)
+DRAG_THRESHOLD    = 0.05    # min Δy normalisoitu jotta lasketaan swipeksi
+                            # (0.10 oli liian korkea — hienovaraiset
+                            #  käden nykäykset eivät rekisteröityneet)
 
 clients: set = set()
 
@@ -358,6 +404,14 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
     current_y     = None
     pinch_dist    = 0.0
 
+    # Open-palm swipe detector — käsi liikkuu ylös/alas ilman pinchiä.
+    # Tämä on kahvanvedon vaihtoehto: monet ihmiset eivät pinchaa luonnollisesti
+    # vaan vain heiluttavat kättä. Pidetään (ts, y) -historia 800 ms ikkunassa
+    # ja kun max-min y-erotus ylittää 0.18, lasketaan se swipeksi.
+    wrist_hist = []   # [(t, y), ...]
+    OPEN_SWIPE_WINDOW_S = 0.8
+    OPEN_SWIPE_RANGE    = 0.18   # vähintään 18% kuvan korkeudesta = swipe
+
     while True:
         try:
             data = sock.recv()
@@ -431,12 +485,52 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
                 style.get_default_hand_landmarks_style(),
                 style.get_default_hand_connections_style(),
             )
+
+            # ── Open-palm swipe ─────────────────────────────────────────────
+            # Tämä laukeaa myös ilman pinchiä — kun käsi vain liikkuu
+            # nopeasti ylös/alas. Käsi on usein vain heilautus, ei
+            # tarkkaa kahvanvetoa, joten tämä on yleensä luonnollisempaa.
+            wrist_hist.append((now, wrist.y))
+            while wrist_hist and now - wrist_hist[0][0] > OPEN_SWIPE_WINDOW_S:
+                wrist_hist.pop(0)
+            if (len(wrist_hist) >= 4
+                    and now - last_swipe_ts > SWIPE_COOLDOWN_S):
+                ys = [p[1] for p in wrist_hist]
+                ymin = min(ys); ymax = max(ys)
+                rng  = ymax - ymin
+                if rng >= OPEN_SWIPE_RANGE:
+                    # Suunta: jos VIIMEISIN y on alle aiemman keskiarvon → liike
+                    # alaspäin (next/skip); ylöspäin → prev/keep.
+                    # NB: y=0 on ruudun yläreuna scene-kameran koordinaateissa.
+                    first_y = wrist_hist[0][1]
+                    last_y  = wrist_hist[-1][1]
+                    if last_y - first_y > OPEN_SWIPE_RANGE * 0.6:
+                        gesture = "next"   # käsi liikkui alas → next/skip
+                    elif first_y - last_y > OPEN_SWIPE_RANGE * 0.6:
+                        gesture = "prev"   # käsi liikkui ylös → prev
+                    else:
+                        gesture = None     # heilautus mutta ei selvää suuntaa
+                    if gesture:
+                        print(f"[Gesture] OPEN-SWIPE {gesture.upper()} "
+                              f"(range {rng:.2f}, Δ {last_y-first_y:+.2f})")
+                        last_swipe_ts    = now
+                        last_swipe_label = f"SWIPE {gesture.upper()}"
+                        last_swipe_at    = now
+                        try:
+                            gesture_q.put_nowait({"source": "ovision-gesture",
+                                                  "gesture": gesture,
+                                                  "ts": now,
+                                                  "via": "open-palm"})
+                        except Exception:
+                            pass
+                        wrist_hist.clear()
         else:
             # Hand left frame → cancel any in-progress grab without firing
             pinching      = False
             grab_start_y  = None
             current_y     = None
             pinch_dist    = 0.0
+            wrist_hist.clear()
 
         # Debug overlays
         meter_h = h - 40

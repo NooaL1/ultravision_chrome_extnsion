@@ -1,13 +1,65 @@
-// YouTube Shorts auto-skip — research-backed multimodal disinterest detector.
-// Algoritmin keskeiset komponentit (lähde: Subconscious Shorts auto-skip, ~150
-// papers CHI/ETRA/IMWUT/ACII 2022–2026):
-//   1. Per-user Welford+EWMA z-score baselines per modality
-//   2. Multi-modal AND-gate: vaadi >=2 modaliteettia kynnyksen yli
-//   3. Schmitt-trigger hysteresis (T_high=0.6, T_low=0.3 z-space)
-//   4. Dwell-time 1.0–1.5 s ennen actionia (matchaa human RT 700–1000 ms)
-//   5. Pre-action indicator t=0.7s alkaen, skip @ 1.0–2.0s
-//   6. Asymmetric error costs: skip-cap ≤25 %/sessio, confidence floor
-//   7. Gesture veto window 300 ms + 3 s undo
+// shorts.js — YouTube Shorts auto-skipper, lasit pääsignaalina
+//
+// =============================================================================
+//   Mitä tämä tiedosto tekee
+// =============================================================================
+// Tämä on YouTube Shorts -sivulle injektoitu logiikka joka päättää milloin
+// nykyinen Shorts-video skipataan automaattisesti. PÄÄTÖKSEN POHJANA OVAT
+// ENSISIJAISESTI SeeTrue-LASIEN signaalit (pupillin koko, sakkadit, katseen
+// poistuminen ruudusta, fixation-dwell) ja niitä TÄYDENTÄVÄT Daemonin oman
+// webkameran signaalit (kasvon ilmeet, pään asento, syke).
+//
+// Lasit ovat keskeisin mittari koska ne antavat:
+//   · Aidot pupillimitat millimetreissä (ei valaistus-arvauksia)
+//   · 50 Hz katseradan jolla näkee tarkasti mihin käyttäjä katsoo
+//   · Sakkadit ja blinkit jotka korreloivat kognitiiviseen kuormaan
+//   · Scene-kameran kuvan jolla tunnistetaan käden eleet (skip/keep)
+//
+// Webkamera täydentää näitä koska se näkee kasvon ja pään koko ajan,
+// vaikka silmänseuranta katkaisisi hetken (silmäluomet, asennon vaihdos).
+//
+// =============================================================================
+//   Algoritmi pähkinänkuoressa
+// =============================================================================
+//  1. JOKAINEN signaali z-score-normalisoidaan käyttäjän omaan baselineen
+//     (Welford-keskiarvo+varianssi 30 näytteen ajan, sitten EWMA α=0.05).
+//     Tämä tarkoittaa että ENSIMMÄISET ~30 SEKUNTIA on "kalibrointia" —
+//     algoritmi vain kerää baseline-tietoa ja skippaa harvemmin.
+//
+//  2. LASKETAAN UNIFIED disinterest score D(t) painotettuna summana
+//     usean modaliteetin z-scoreista (yaw 0.20, gazeOff 0.20, pupil 0.15
+//     käännettynä, blink 0.10, AU4 brow-down 0.10, AU43 silmät kiinni 0.10,
+//     smile 0.10 käännettynä, sacc 0.05, HR 0.05, pitch 0.10).
+//
+//  3. MULTI-MODAL AND-GATE: vaaditaan että VÄHINTÄÄN N modaliteettia ylittää
+//     kynnyksen ennen kuin algoritmi virittää itsensä. N säätyy herkkyydellä:
+//     herkkyys 0  → N=2 (kärsivällinen)
+//     herkkyys 100 → N=1 (aggressiivinen, mikä tahansa selvä signaali riittää)
+//
+//  4. SCHMITT-TRIGGER + DWELL: kun D(t) ylittää T_high, käynnistyy ajastin.
+//     Kun ajastin saavuttaa "dwell"-ajan (1.0–1.5 s), video skipataan.
+//     Sillä välin pinkki PRE-ACTION-PALKKI mittarin yli kasvaa, jotta käyttäjä
+//     tietää että skip on tulossa ja voi vetää käden ylös tai katsoa videoon
+//     intensiivisesti — silloin D laskee T_low alle ja schmitt purkaantuu.
+//
+//  5. ELEET ohittavat algoritmin:
+//        Käsi alas (scene-kamera)  → välitön skip
+//        Käsi ylös (scene-kamera)  → palaa edelliseen videoon (ArrowUp)
+//        Pään pudistus            → välitön skip (varageeli)
+//        Pään nyökkäys            → keep (estä skip)
+//
+// =============================================================================
+//   Mitä UI:ssa näkyy ja mitä se tarkoittaa
+// =============================================================================
+//   · Pystysuora MITTARI vasemmalla = engagement-arvio 0..100% (UI-kosmetiikka)
+//   · MITTARIN PINKKI palkki = pre-action-indicator (skip tulossa, ehdit perua)
+//   · "kiinnostaa / neutraali / tylsä" = sanallinen tila
+//   · Modalities-rivi (esim. "yaw=1.2 pupil=-0.4 blink=0.8") = kunkin signaalin
+//     z-score reaaliajassa. Punaiset numerot ylittävät T_high — niistä
+//     algoritmi tekee skip-päätöksen.
+//   · Herkkyys-liuku = säätää T_high/T_low/dwell aggressiivisuutta
+//   · Bottom-hint = mitä ele tekisi nyt
+//   · ⏻-nappi = päälle/pois kytkin
 
 (() => {
   if (window.__daemonShortsInjected) return;
@@ -341,16 +393,26 @@
     return range > 18 && cross >= 3;
   }
 
-  // ── Sensitivity slider modifies T_high/T_low/dwell only, not the structure ──
+  // ── Herkkyysliuku säätää aggressiivisuutta — algoritmin rakenne pysyy samana
+  // Liuku 0   = kärsivällinen: vaaditaan 2 modaliteettia + iso z-margin + pitkä dwell
+  // Liuku 50  = balanced (oletus)
+  // Liuku 100 = aggressiivinen: 1 selkeän signaalin (esim. katse pois) pieni
+  //            nykäys riittää, dwell vain ~700 ms — skippaa heti kun mikä
+  //            tahansa tylsyyssignaali ylittää käyttäjän baselinen.
   function tunings() {
     const t = sensitivity / 100;   // 0 = patient, 1 = aggressive
     return {
-      T_high: 0.75 - t * 0.30,    // 0.75 .. 0.45 z-space
-      T_low:  0.40 - t * 0.20,    // 0.40 .. 0.20
-      dwellMs: 1500 - t * 500,    // 1500 .. 1000 ms
-      preStartMs: 700,            // pre-action indicator alkaa 700 ms kohdalla
-      minVideoMs: 2500 - t * 1500,
-      reqAboveHigh: t < 0.5 ? 2 : 1,   // patient: vaadi 2 modaliteettia, aggressiivinen: 1
+      T_high:    0.65 - t * 0.55,         // 0.65 .. 0.10 z-space
+      T_low:     0.35 - t * 0.30,         // 0.35 .. 0.05
+      dwellMs:   1500 - t * 800,          // 1500 ms .. 700 ms
+      preStartMs: Math.max(150, 700 - t * 550), // 700 ms .. 150 ms
+      minVideoMs: Math.max(400, 2500 - t * 2100), // 2500 ms .. 400 ms
+      // Tarvittavat samanaikaisesti aktiiviset modaliteetit (multi-modal AND-gate):
+      reqAboveHigh: t < 0.33 ? 2 : 1,
+      // Confidence floor: signaalit joiden |z| >= 0.5
+      reqSignals:   t < 0.50 ? 2 : 1,
+      // Skip-cap (osuus videoista joita saa skipata sessiossa):
+      skipCap:      0.25 + t * 0.55,      // 0.25 .. 0.80
     };
   }
 
@@ -445,12 +507,14 @@
 
     updateMods(dis.m, dis.aboveHigh);
 
-    // Skip-cap: ≤25 % of videos in session (Bliss 1993, Moder 2024)
+    // Skip-cap: kuinka iso osuus sessiosta saa olla auto-skipattu
+    // (alarm fatigue, Bliss 1993; Moder 2024). Säädetään herkkyysliu'usta.
     const skipRatio = videosSeen > 0 ? videosSkipped / videosSeen : 0;
-    const overCap = skipRatio > 0.25 && videosSeen > 4;
+    const overCap = skipRatio > tun.skipCap && videosSeen > 4;
 
-    // Confidence floor: tarvitaan vähintään 2 merkitsevää signaalia (|z|>=0.5)
-    const enoughConfidence = dis.signalsAbove >= 2;
+    // Confidence floor: vaaditaan riittävästi merkitseviä signaaleja (|z|>=0.5).
+    // Patient-tilassa 2, aggressiivisessa 1.
+    const enoughConfidence = dis.signalsAbove >= tun.reqSignals;
 
     // Multi-modal AND-gate: vaadi reqAboveHigh modaliteettia kynnyksen yli
     const gateOpen = dis.aboveHigh >= tun.reqAboveHigh;
@@ -486,6 +550,8 @@
     }
   }
 
+  // Lähetä YouTuben oma "scroll alas seuraavaan videoon" -keyboard event.
+  // YouTube Shorts kuuntelee ArrowDown:ia → video vaihtuu seuraavaan.
   function skipNext(reason) {
     lastSkipT       = Date.now();
     lastAutoSkipT   = lastSkipT;
@@ -496,6 +562,21 @@
     if (skipLog.length > 200) skipLog.shift();
     videosSkipped++;
     const opts = { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true, cancelable: true };
+    document.dispatchEvent(new KeyboardEvent('keydown', opts));
+    document.dispatchEvent(new KeyboardEvent('keyup',   opts));
+    resetVideoState();
+  }
+
+  // Lähetä YouTuben "scroll ylös edelliseen videoon" -keyboard event.
+  // Käytetään SeeTrue-laseilla tehdyn ylös-swipen tai pään nyökkäyksen
+  // jälkeen — näin käyttäjä voi selata Shortseja molempiin suuntiin
+  // pelkkä lasit päässä.
+  function goPrev(reason) {
+    lastSkipT     = Date.now();   // sama cooldown ettei ARM-tila tärisi
+    pendingSkipT  = 0;
+    setPreAction(0);
+    flashKeep();
+    const opts = { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38, which: 38, bubbles: true, cancelable: true };
     document.dispatchEvent(new KeyboardEvent('keydown', opts));
     document.dispatchEvent(new KeyboardEvent('keyup',   opts));
     resetVideoState();
@@ -536,13 +617,18 @@
         const ts = (g.ts || 0) * 1000;
         if (!window.__d_lastGestureTs || ts > window.__d_lastGestureTs) {
           window.__d_lastGestureTs = ts;
+          // Diagnostiikka — näkyy jos avaat F12-konsolin Shorts-sivulla.
+          // Jos näet tämän rivin → bridgen ele saapui Daemoniin asti.
+          // Jos et → vika on bridge↔daemon-relayssä (avaa offscreen-konsoli
+          // ja katso [fusion] ingest src=ovision-gesture).
+          console.log('[shorts] SeeTrue gesture:', g.gesture, '@ ts', ts);
           if (g.gesture === 'next' && Date.now() - lastSkipT > 1500) {
+            // Lasit-swipe alas → SKIPPAA TÄMÄ VIDEO
             skipNext('gesture');
-          } else if (g.gesture === 'prev') {
-            // KEEP — venytä videoaikaa, pakota schmitt pois
-            videoStartT = performance.now() - 100;
-            schmittArmed = false; armStartT = 0; setPreAction(0);
-            flashKeep();
+          } else if (g.gesture === 'prev' && Date.now() - lastSkipT > 1500) {
+            // Lasit-swipe ylös → SELAA TAKAISIN EDELLISEEN VIDEOON
+            // (ei pelkkä "keep" enää — ylös-swipe on aktiivinen back-navigation)
+            goPrev('gesture');
           }
         }
       }
