@@ -364,11 +364,21 @@ async def gaze_relay(q):
 # ── Gesture worker subprocess (cv2.imshow safe in main thread) ──────────────
 def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
                    show_window: bool = True):
-    """Runs in its own process so cv2.imshow + cv2.waitKey work properly."""
+    """Runs in its own process so cv2.imshow + cv2.waitKey work properly.
+
+    Tämä prosessi:
+      1. Vastaanottaa SeeTrue-skenekameran kuvavirran ZMQ:n yli (port 3425)
+      2. Ajaa MediaPipe-hands sen päällä → tunnistaa pinch+drag ja open-palm
+         swipe-eleet → push gesture_q:hun
+      3. Lähettää JOKA 3. KUVAN downscaled JPEG:nä Daemonin HUDille jotta
+         käyttäjä näkee Chrome-laajennuksen sisällä lasien etupuolisen kuvan
+         + sen päällä gaze-pisteen (mihin hän juuri katsoo)
+    """
     import zmq as zmq_local
     import numpy as np
     import cv2 as cv
     import mediapipe as mp
+    import base64
 
     ctx  = zmq_local.Context()
     sock = ctx.socket(zmq_local.PULL)
@@ -444,6 +454,27 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
         now = time.time()
         h, w = img.shape[:2]
         hand_ok = results is not None and results.multi_hand_landmarks
+
+        # ── Stream pieni scene-frame Daemon HUDille ──────────────────────
+        # Joka 3. kuva (10 fps): downscale 240x180, JPEG q60, base64.
+        # Daemon piirtää tämän + gaze-pisteen päälle, niin näet
+        # chrome-laajennuksessa "mitä lasit näkevät juuri nyt + missä
+        # katseesi on". Bandwidth ~80 KB/s — sopiva WebSocketille.
+        if frame_idx % 3 == 0:
+            try:
+                small = cv.resize(img, (240, 180), interpolation=cv.INTER_AREA)
+                ok, buf = cv.imencode(".jpg", small,
+                                      [cv.IMWRITE_JPEG_QUALITY, 60])
+                if ok:
+                    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                    gesture_q.put_nowait({
+                        "source": "ovision-scene",
+                        "ts": now,
+                        "w": 240, "h": 180,
+                        "jpeg": b64,
+                    })
+            except Exception:
+                pass
 
         if hand_ok:
             lm = results.multi_hand_landmarks[0]

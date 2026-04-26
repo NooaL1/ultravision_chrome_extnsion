@@ -19,6 +19,7 @@ let lastOvision = {
   gesture: null,     // { gesture, ts }
   face: null,        // { smile, mouth_open, brow, ts }
   bridge: null,      // { seetrue_alive, msgs_per_sec, last_event_age_s, total_msgs, ts }
+  scene: null,       // { dataUrl, w, h, ts } SeeTrue-skenekameran live JPEG
   // derived live signals
   saccadePerSec: 0,
   fixDwellMs: 0,
@@ -108,6 +109,16 @@ function ingestOvisionMessage(obj) {
     lastOvision.face = { ...(obj.face || {}), ts: obj.ts };
     return;
   }
+  if (src === 'ovision-scene' && obj.jpeg) {
+    // Lasit-skenekameran kuva (240×180 JPEG base64).
+    // Tallennetaan dataURL ja pusketaan content.js:lle joka piirtää
+    // sen + gaze-pisteen päälle "mihin lasit katsovat juuri nyt".
+    lastOvision.scene = {
+      dataUrl: 'data:image/jpeg;base64,' + obj.jpeg,
+      w: obj.w || 240, h: obj.h || 180, ts: obj.ts,
+    };
+    return;
+  }
   // Bridge heartbeat — diagnostiikka 1 Hz: kertoo onko SeeTrue oikeasti elossa
   if (src === 'bridge' && obj.heartbeat) {
     lastOvision.bridge = {
@@ -149,6 +160,7 @@ function emitOvisionTick() {
     fixDwellMs: lastOvision.fixDwellMs,
     face: lastOvision.face,
     bridge: lastOvision.bridge,
+    scene: lastOvision.scene,   // SeeTrue scene-cam dataURL + gaze overlays content-side
     connected: fusionConnected,
   }};
   _emitCount++;
@@ -379,6 +391,12 @@ function loop() {
     const r = landmarker.detectForVideo(video, performance.now());
     if (r.faceLandmarks && r.faceLandmarks.length > 0) {
       roi = computeForeheadROI(r.faceLandmarks[0], sample.width, sample.height);
+      // Renderöi pieni webkameran preview + face-mesh overlay HUDille.
+      // Tämä näkee Daemonin paneelissa "tämä on sinä, tällä kohden Daemon
+      // näkee kasvosi" — tehokas visuaalinen vahvistus että se toimii.
+      if (frame % 3 === 0) {
+        renderWebcamPreview(r.faceLandmarks[0]);
+      }
     }
     // Pään asento — joka frame, kevyt
     if (r.facialTransformationMatrixes && r.facialTransformationMatrixes.length > 0) {
@@ -444,6 +462,73 @@ function inferEmotion(categories) {
   cands.sort((a, b) => b[1] - a[1]);
   const [label, score] = cands[0];
   return score < 0.12 ? { label: 'neutral', score: 0 } : { label, score };
+}
+
+// ── Webkameran preview HUDille ──────────────────────────────────────────
+// Renderöi webkameran kuvan pienelle canvasille + face-mesh overlay
+// (tärkeimmät landmarkit + kontuurit) ja lähettää pixel-datan content.js:lle
+// joka piirtää sen Daemon-paneelin "WEBCAM"-celliin. Pyörii ~10 fps:llä.
+const WEBCAM_PREVIEW_W = 240, WEBCAM_PREVIEW_H = 180;
+let _webcamCanvas = null, _webcamCtx = null, _webcamImg = null;
+
+// Mediapipe Face Mesh -indekseiltä piirrettävät pisteet:
+// silmien ääriviivat, kulmat, suun reunat, kasvon ovaali — visuaalinen impact
+// ilman että piirretään koko 478 pistettä joka frame.
+const FACE_HIGHLIGHT_IDX = [
+  // kasvojen ovaali
+  10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+  397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+  172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
+  // silmät
+  33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246,
+  263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466,
+  // kulmakarvat
+  70, 63, 105, 66, 107, 55, 65, 52, 53, 46,
+  300, 293, 334, 296, 336, 285, 295, 282, 283, 276,
+  // suu
+  61, 84, 17, 314, 405, 320, 307, 375, 321, 308, 324, 318,
+  78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415,
+];
+
+function renderWebcamPreview(landmarks) {
+  if (!_webcamCanvas) {
+    _webcamCanvas = document.createElement('canvas');
+    _webcamCanvas.width = WEBCAM_PREVIEW_W;
+    _webcamCanvas.height = WEBCAM_PREVIEW_H;
+    _webcamCtx = _webcamCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  // 1) Piirrä peilattu video (selfie-näkymä) preview-kokoon
+  _webcamCtx.save();
+  _webcamCtx.translate(WEBCAM_PREVIEW_W, 0);
+  _webcamCtx.scale(-1, 1);
+  _webcamCtx.drawImage(video, 0, 0, WEBCAM_PREVIEW_W, WEBCAM_PREVIEW_H);
+  _webcamCtx.restore();
+
+  // 2) Piirrä face-landmarkit reunusta hiukan vahvistettuna
+  _webcamCtx.fillStyle = '#5c9eff';
+  _webcamCtx.shadowColor = '#5c9eff';
+  _webcamCtx.shadowBlur = 4;
+  for (const idx of FACE_HIGHLIGHT_IDX) {
+    const p = landmarks[idx];
+    if (!p) continue;
+    // Mirror x because the video was mirrored above
+    const x = (1 - p.x) * WEBCAM_PREVIEW_W;
+    const y = p.y * WEBCAM_PREVIEW_H;
+    _webcamCtx.fillRect(x - 1, y - 1, 2, 2);
+  }
+  _webcamCtx.shadowBlur = 0;
+  // 3) Saa raw pixels → content.js voi piirtää ne suoraan
+  if (!_webcamImg) {
+    _webcamImg = _webcamCtx.getImageData(0, 0, WEBCAM_PREVIEW_W, WEBCAM_PREVIEW_H);
+  } else {
+    _webcamImg = _webcamCtx.getImageData(0, 0, WEBCAM_PREVIEW_W, WEBCAM_PREVIEW_H);
+  }
+  send({
+    webcamPreview: {
+      pixels: _webcamImg.data,
+      w: WEBCAM_PREVIEW_W, h: WEBCAM_PREVIEW_H,
+    }
+  });
 }
 
 function computeForeheadROI(lm, W, H) {

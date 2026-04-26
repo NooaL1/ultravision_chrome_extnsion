@@ -133,6 +133,19 @@
 #__d-amp { width: 100%; height: 90px; image-rendering: pixelated;
   border: 1px solid rgba(255,255,255,.05); border-radius: 2px;
   box-shadow: 0 0 18px rgba(255,77,109,.15) inset; }
+
+/* Webkamera + lasien skenekamera previewt */
+#__d-webcam, #__d-scene {
+  width: 100%; height: auto;
+  border-radius: 2px;
+  background: #000;
+  border: 1px solid rgba(80,200,255,.18);
+  box-shadow: 0 0 12px rgba(80,200,255,.10) inset;
+}
+#__d-scene {
+  border-color: rgba(255,77,109,.28);
+  box-shadow: 0 0 14px rgba(255,77,109,.15) inset;
+}
 #__d-wave, #__d-spec, #__d-emoline, #__d-bpmline {
   width: 100%; height: auto;
   background: rgba(0,0,0,.3); border-radius: 2px;

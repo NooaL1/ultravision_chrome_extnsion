@@ -88,6 +88,20 @@
             </div>
           </div>
         </div>
+
+        <div class="__d-cell __d-wide" id="__d-webcam-cell">
+          <div class="__d-section-label">WEBCAM · face mesh
+            <span class="__d-hint">live preview</span>
+          </div>
+          <canvas id="__d-webcam" width="240" height="180"></canvas>
+        </div>
+
+        <div class="__d-cell __d-wide" id="__d-scene-cell">
+          <div class="__d-section-label">LASIEN KAMERA · gaze overlay
+            <span class="__d-hint" id="__d-scene-hint">offline</span>
+          </div>
+          <canvas id="__d-scene" width="240" height="180"></canvas>
+        </div>
       </div>
       <div class="__d-foot">
         <span id="__d-gazestat">gaze ·</span>
@@ -118,6 +132,19 @@
   const ampCv  = $('#__d-amp');
   const ampCtx = ampCv.getContext('2d');
   const ampImg = ampCtx.createImageData(60, 45);
+
+  // Webkamera-preview canvas (face mesh overlaylla, offscreen.js renderöi)
+  const webcamCv  = $('#__d-webcam');
+  const webcamCtx = webcamCv.getContext('2d');
+  const webcamImg = webcamCtx.createImageData(240, 180);
+
+  // SeeTrue scene-cam canvas (lasit-etukameran kuva + gaze-piste)
+  const sceneCv      = $('#__d-scene');
+  const sceneCtx     = sceneCv.getContext('2d');
+  const sceneHintEl  = $('#__d-scene-hint');
+  let _sceneImageEl  = null;          // <img>-elementti dataURL-purkamiseen
+  let _sceneLastUrl  = null;          // välttääksemme saman framin uudelleenlatauksen
+  let _sceneImageReady = false;
 
   // SeeTrue cell
   const stCell    = $('#__d-seetrue');
@@ -172,6 +199,70 @@
     panel.style.right = 'auto';
   });
   addEventListener('mouseup', () => { dragging = false; panel.style.transition = ''; });
+
+  // ---- webcam preview rendering ----
+  // offscreen.js piirtää webkameran preview-kuvan + face-mesh-overlayn ja
+  // lähettää raw pixelit. Me vain blittaamme ne canvasille.
+  function renderWebcam(payload) {
+    if (!payload || !payload.pixels) return;
+    const data = webcamImg.data;
+    const src = payload.pixels;
+    // Uint8ClampedArray takes a structuredClone. Kopioidaan suoraan.
+    for (let i = 0; i < data.length; i++) data[i] = src[i];
+    webcamCtx.putImageData(webcamImg, 0, 0);
+  }
+
+  // ---- SeeTrue scene-cam rendering ----
+  // Bridge lähettää 240×180 JPEG/base64. Daemon offscreen forwardoi sen
+  // dataURL-muodossa. Lataamme sen <img>:hin ja piirrämme canvasille +
+  // gaze-pisteen päälle (lasien gx/gy on jo skaalattu 0..1 → carrying frame).
+  function renderScene(scene, gaze) {
+    if (!scene || !scene.dataUrl) return;
+    if (scene.dataUrl !== _sceneLastUrl) {
+      _sceneLastUrl = scene.dataUrl;
+      _sceneImageReady = false;
+      if (!_sceneImageEl) _sceneImageEl = new Image();
+      _sceneImageEl.onload = () => {
+        _sceneImageReady = true;
+        drawScene(_sceneImageEl, gaze);
+      };
+      _sceneImageEl.src = scene.dataUrl;
+    } else if (_sceneImageReady) {
+      drawScene(_sceneImageEl, gaze);
+    }
+  }
+  function drawScene(img, gaze) {
+    const W = sceneCv.width, H = sceneCv.height;
+    sceneCtx.clearRect(0, 0, W, H);
+    try { sceneCtx.drawImage(img, 0, 0, W, H); } catch {}
+    // Gaze piste — gx/gy on normalisoitu 0..1 scene-camera coords
+    if (gaze && typeof gaze.gx === 'number' && typeof gaze.gy === 'number'
+        && gaze.gx >= -0.05 && gaze.gx <= 1.05
+        && gaze.gy >= -0.05 && gaze.gy <= 1.05) {
+      const x = gaze.gx * W;
+      const y = gaze.gy * H;
+      // Crosshair + ring
+      sceneCtx.strokeStyle = '#ff4d6d';
+      sceneCtx.lineWidth = 2;
+      sceneCtx.shadowColor = '#ff4d6d';
+      sceneCtx.shadowBlur = 8;
+      sceneCtx.beginPath();
+      sceneCtx.arc(x, y, 12, 0, Math.PI * 2);
+      sceneCtx.stroke();
+      sceneCtx.beginPath();
+      sceneCtx.moveTo(x - 18, y); sceneCtx.lineTo(x - 6, y);
+      sceneCtx.moveTo(x + 6, y);  sceneCtx.lineTo(x + 18, y);
+      sceneCtx.moveTo(x, y - 18); sceneCtx.lineTo(x, y - 6);
+      sceneCtx.moveTo(x, y + 6);  sceneCtx.lineTo(x, y + 18);
+      sceneCtx.stroke();
+      // Pieni täytetty piste keskelle
+      sceneCtx.shadowBlur = 0;
+      sceneCtx.fillStyle = '#fff';
+      sceneCtx.beginPath();
+      sceneCtx.arc(x, y, 2.5, 0, Math.PI * 2);
+      sceneCtx.fill();
+    }
+  }
 
   // ---- gaze ball ----
   let smoothX = 0, smoothY = 0, gazeSeen = false, lastGazeT = 0;
@@ -377,6 +468,18 @@
     if (p.spectrum)        safe(renderSpec,        p.spectrum,        'renderSpec');
     if (p.emotionTimeline) safe(renderEmoTimeline, p.emotionTimeline, 'renderEmoTimeline');
     if (p.bpmTimeline)     safe(renderBpmTrend,    p.bpmTimeline,     'renderBpmTrend');
+    if (p.webcamPreview)   safe(renderWebcam,      p.webcamPreview,   'renderWebcam');
+    // Lasit-skenekameran kuva + gaze overlayn päälle. Tarvitsee
+    // sekä scene-payloadin että uusimman gaze-koordinaatin.
+    if (p.ovision && p.ovision.scene) {
+      try { renderScene(p.ovision.scene, p.ovision.gaze); }
+      catch (e) { console.warn('[content] renderScene error', e); }
+      if (sceneHintEl) {
+        const ageMs = performance.now() - (p.ovision.scene.ts || 0) * 1000;
+        sceneHintEl.textContent = ageMs < 2000 ? 'live' : 'stale';
+        sceneHintEl.style.color = ageMs < 2000 ? '#51cf66' : '#ffc850';
+      }
+    }
     if (p.gaze) { try { placeGaze(p.gaze.x, p.gaze.y); } catch (e) { console.warn('[content] placeGaze', e); } }
     // fusion.connected päivittää bridge-yhteyden tilan; varsinaisen 3-tilaisen
     // chipin renderöinti tehdään renderSeetrue:ssa kun ovision-snapshot saapuu.
