@@ -1,63 +1,63 @@
-# bridge.py — SeeTrue ↔ WebSocket-silta + käsi-eleentunnistus
+# bridge.py — SeeTrue ↔ WebSocket bridge + hand-gesture recognition
 """
 =============================================================================
-  Mitä tämä tiedosto on
+  What this file is
 =============================================================================
-Tämä on SILTA SeeTrue-silmänseurantalasien ja Daemon-Chrome-laajennuksen
-välillä. SeeTrue-lasit ovat järjestelmän PÄÄSIGNAALI:
-    · katseen koordinaatit (gx, gy)
-    · pupillin koko vasemmalle ja oikealle silmälle (mm)
-    · sakkadit, fixationit, blinkit
-    · scene-kameran video (lasien etupuolelta) → käsieleet
+A BRIDGE between the SeeTrue eye-tracking glasses and the Daemon Chrome
+extension. The SeeTrue glasses are the PRIMARY signal of the whole system:
+    · gaze coordinates (gx, gy)
+    · pupil size for left and right eye (mm)
+    · saccades, fixations, blinks
+    · scene-camera video (from the front of the glasses) → hand gestures
 
-Kaikki tämä virtaa ZMQ:n yli SeeTruen omasta serveriohjelmasta
-(SeeTrueEyeServer.exe) bridgeen, joka:
-    1. Käynnistää datavirran lähettämällä UDP-handshakean serverille
+All of this streams over ZMQ from SeeTrue's own server program
+(SeeTrueEyeServer.exe) into the bridge, which:
+    1. Starts the data stream by sending a UDP handshake to the server
        (sendEyeTrackerTypeData → setEyeTrackerDevice → runPictureProcessing)
-    2. Vastaanottaa ZMQ-viestit erillisessä Python-aliprosessissa
-       (välttäen Windowsin asyncio + zmq.asyncio -ristiriidan)
-    3. Ajaa MediaPipe Hands -käsiraajamallia scene-kameran framessa
-       ja tunnistaa pinch-grab + drag -liikkeitä SWIPE-tapahtumiksi
-    4. Tarjoaa kaiken WebSocket-clienteille porttiin ws://localhost:8765
-    5. Lähettää 1 Hz heartbeatin jotta clientit tietävät onko data elossa
+    2. Receives ZMQ messages in a dedicated Python subprocess (avoiding
+       the Windows asyncio + zmq.asyncio interaction bug)
+    3. Runs MediaPipe Hands on the scene-camera frame and detects
+       pinch-grab + drag motions as SWIPE events
+    4. Exposes everything to WebSocket clients on ws://localhost:8765
+    5. Emits a 1 Hz heartbeat so clients know the data stream is alive
 
-Daemon-laajennus (daemon-extension/) yhdistyy tähän, ottaa SeeTruen datan,
-yhdistää sen omaan webkameran rPPG + tunne-analyysiin, ja päättelee siitä
-tulisiko YouTube Shorts skipata.
+The Daemon extension (daemon-extension/) connects here, takes the SeeTrue
+data, fuses it with its own webcam rPPG + emotion analysis, and decides
+whether the current YouTube Short should be auto-skipped.
 
 =============================================================================
-  Tyypilliset käynnistystavat
+  Typical startup commands
 =============================================================================
-SeeTrue-laitteen kanssa (oletus IP 172.20.10.3, connect-tila):
+With the SeeTrue device (default IP 172.20.10.3, connect mode):
     python bridge.py
 
-Jos SeeTruen IP on eri:
+If the SeeTrue is on a different IP:
     python bridge.py --remote_ip 192.168.X.Y
 
-Jos SeeTrue PUSHaa lapotpiisi (laptop bindaa porttiin):
+If the SeeTrue PUSHes to the laptop (laptop binds the port):
     python bridge.py --bind
 
-Ilman laitteistoa, simulaattorilla (kahdessa terminaalissa):
+No hardware, run with the simulator (in two terminals):
     python ../gaze_data_simulator/simulator.py
     python bridge.py --simulator
 
-Demoa varten (kevyt RAM, ei cv2-ikkunoita):
+Headless (low RAM, no cv2 windows):
     python bridge.py --no-display
 
 =============================================================================
-  Mitä lokissa pitäisi näkyä kun kaikki toimii
+  What you should see in the log when everything works
 =============================================================================
-    [preflight] ✓ 172.20.10.3 vastaa pingiin
+    [preflight] ✓ 172.20.10.3 responded to ping
     [handshake] kicking SeeTrueEyeServer at 172.20.10.3:3429
     [handshake] → UDP {'action': 'sendEyeTrackerTypeData'}
     [handshake] → UDP {'action': 'runPictureProcessing', ...}
-    [ZMQ] gaze parsed #1: {pupilL: 2.84, pupilR: 4.19, ...}   ← lasit syöttävät
-    [Gesture] frame #1 (188 KB)                               ← scene-kamera
-    [WS] client connected                                     ← Daemon yhdistyi
-    [WS] inbound #1: {"source":"daemon", "bpm": 65, ...}      ← Daemon syöttää HR
+    [ZMQ] gaze parsed #1: {pupilL: 2.84, pupilR: 4.19, ...}   ← glasses streaming
+    [Gesture] frame #1 (188 KB)                               ← scene camera
+    [WS] client connected                                     ← Daemon connected
+    [WS] inbound #1: {"source":"daemon", "bpm": 65, ...}      ← Daemon HR data
 
-Jos näet "still waiting for first gaze sample" → SeeTrue ei lähetä dataa.
-Tarkista IP, verkko, ja että SeeTrueEyeServer on käynnistetty laitteella.
+If you see "still waiting for first gaze sample" → SeeTrue isn't streaming.
+Check the IP, the network, and that SeeTrueEyeServer is running on the device.
 """
 
 import argparse
@@ -1033,7 +1033,7 @@ async def main():
     print(f"  WebSocket:  ws://{WS_HOST}:{WS_PORT}")
     print(f"  Auto-start: {'YES (UDP handshake)' if auto_start else 'no'}")
     if not args.simulator and not bind_mode:
-        print("  Hint: jos hiljaisuus jatkuu yli 5s — kokeile --bind tai --simulator")
+        print("  Hint: if silence persists >5 s — try --bind or --simulator")
     print("=" * 64)
 
     # ── Pre-flight: voiko remote_ip:tä edes pingata? ────────────────────────
@@ -1047,16 +1047,16 @@ async def main():
         except Exception:
             reachable = False
         if not reachable:
-            print(f"[preflight] ⚠ {args.remote_ip} EI VASTAA pingiin.")
-            print(f"[preflight]   Laptop on todennäköisesti eri verkossa kuin SeeTrue-server.")
-            print(f"[preflight]   Tarkista: ipconfig | findstr IPv4")
-            print(f"[preflight]   Vinkkejä:")
-            print(f"[preflight]     · liity samaan WiFiin/hotspotiin missä SeeTrue-kone on")
-            print(f"[preflight]     · jos server on samassa LANissa, etsi sen IP arp -a:lla")
-            print(f"[preflight]     · simulaattoritesti: --simulator (toiseen termiin simulator.py)")
-            print(f"[preflight]   Bridge jatkaa silti — voit pysäyttää Ctrl+C:llä.\n")
+            print(f"[preflight] ⚠ {args.remote_ip} did NOT respond to ping.")
+            print(f"[preflight]   Your laptop is probably on a different network than the SeeTrue server.")
+            print(f"[preflight]   Check: ipconfig | findstr IPv4")
+            print(f"[preflight]   Tips:")
+            print(f"[preflight]     · join the same WiFi / hotspot the SeeTrue PC is on")
+            print(f"[preflight]     · if the server is on this LAN, find its IP via 'arp -a'")
+            print(f"[preflight]     · run a simulator test: --simulator (run simulator.py in another terminal)")
+            print(f"[preflight]   Bridge will continue anyway — Ctrl+C to abort.\n")
         else:
-            print(f"[preflight] ✓ {args.remote_ip} vastaa pingiin")
+            print(f"[preflight] ✓ {args.remote_ip} responded to ping")
 
     # ── UDP handshake: tell SeeTrueEyeServer to start streaming ─────────────
     # Tämä korvaa SeeTrueTechLauncherin tekemän alustusvaiheen. Ilman tätä ZMQ

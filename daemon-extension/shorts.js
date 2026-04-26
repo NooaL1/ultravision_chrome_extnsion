@@ -1,63 +1,62 @@
-// shorts.js — YouTube Shorts auto-skipper, lasit pääsignaalina
+// shorts.js — YouTube Shorts auto-skipper, glasses are the primary signal
 //
 // =============================================================================
-//   Mitä tämä tiedosto tekee
+//   What this file does
 // =============================================================================
-// Tämä on YouTube Shorts -sivulle injektoitu logiikka joka päättää milloin
-// nykyinen Shorts-video skipataan automaattisesti. PÄÄTÖKSEN POHJANA OVAT
-// ENSISIJAISESTI SeeTrue-LASIEN signaalit (pupillin koko, sakkadit, katseen
-// poistuminen ruudusta, fixation-dwell) ja niitä TÄYDENTÄVÄT Daemonin oman
-// webkameran signaalit (kasvon ilmeet, pään asento, syke).
+// Logic injected into the YouTube Shorts page that decides when the current
+// Short gets auto-skipped. The decision is driven PRIMARILY by SeeTrue-glasses
+// signals (pupil size, saccades, gaze leaving the screen, fixation dwell) and
+// SUPPLEMENTED by the Daemon webcam (facial expressions, head pose, heart rate).
 //
-// Lasit ovat keskeisin mittari koska ne antavat:
-//   · Aidot pupillimitat millimetreissä (ei valaistus-arvauksia)
-//   · 50 Hz katseradan jolla näkee tarkasti mihin käyttäjä katsoo
-//   · Sakkadit ja blinkit jotka korreloivat kognitiiviseen kuormaan
-//   · Scene-kameran kuvan jolla tunnistetaan käden eleet (skip/keep)
+// The glasses are the most important sensor because they give:
+//   · Real pupil size in millimetres (no luminance guesswork)
+//   · 50 Hz gaze track so we know exactly where the user is looking
+//   · Saccades and blinks that correlate with cognitive load
+//   · The scene-camera image used for hand-gesture recognition (skip/keep)
 //
-// Webkamera täydentää näitä koska se näkee kasvon ja pään koko ajan,
-// vaikka silmänseuranta katkaisisi hetken (silmäluomet, asennon vaihdos).
-//
-// =============================================================================
-//   Algoritmi pähkinänkuoressa
-// =============================================================================
-//  1. JOKAINEN signaali z-score-normalisoidaan käyttäjän omaan baselineen
-//     (Welford-keskiarvo+varianssi 30 näytteen ajan, sitten EWMA α=0.05).
-//     Tämä tarkoittaa että ENSIMMÄISET ~30 SEKUNTIA on "kalibrointia" —
-//     algoritmi vain kerää baseline-tietoa ja skippaa harvemmin.
-//
-//  2. LASKETAAN UNIFIED disinterest score D(t) painotettuna summana
-//     usean modaliteetin z-scoreista (yaw 0.20, gazeOff 0.20, pupil 0.15
-//     käännettynä, blink 0.10, AU4 brow-down 0.10, AU43 silmät kiinni 0.10,
-//     smile 0.10 käännettynä, sacc 0.05, HR 0.05, pitch 0.10).
-//
-//  3. MULTI-MODAL AND-GATE: vaaditaan että VÄHINTÄÄN N modaliteettia ylittää
-//     kynnyksen ennen kuin algoritmi virittää itsensä. N säätyy herkkyydellä:
-//     herkkyys 0  → N=2 (kärsivällinen)
-//     herkkyys 100 → N=1 (aggressiivinen, mikä tahansa selvä signaali riittää)
-//
-//  4. SCHMITT-TRIGGER + DWELL: kun D(t) ylittää T_high, käynnistyy ajastin.
-//     Kun ajastin saavuttaa "dwell"-ajan (1.0–1.5 s), video skipataan.
-//     Sillä välin pinkki PRE-ACTION-PALKKI mittarin yli kasvaa, jotta käyttäjä
-//     tietää että skip on tulossa ja voi vetää käden ylös tai katsoa videoon
-//     intensiivisesti — silloin D laskee T_low alle ja schmitt purkaantuu.
-//
-//  5. ELEET ohittavat algoritmin:
-//        Käsi alas (scene-kamera)  → välitön skip
-//        Käsi ylös (scene-kamera)  → palaa edelliseen videoon (ArrowUp)
-//        Pään pudistus            → välitön skip (varageeli)
-//        Pään nyökkäys            → keep (estä skip)
+// The webcam complements this because it sees the face and head continuously,
+// even when eye-tracking briefly stops (eyelids, posture change).
 //
 // =============================================================================
-//   Mitä UI:ssa näkyy ja mitä se tarkoittaa
+//   Algorithm in a nutshell
 // =============================================================================
-//   · Pystysuora MITTARI vasemmalla = engagement-arvio 0..100% (UI-kosmetiikka)
-//   · MITTARIN PINKKI palkki = pre-action-indicator (skip tulossa, ehdit perua)
-//   · "kiinnostaa / neutraali / tylsä" = sanallinen tila
-//   · Modalities-rivi (esim. "yaw=1.2 pupil=-0.4 blink=0.8") = kunkin signaalin
-//     z-score reaaliajassa. Punaiset numerot ylittävät T_high — niistä
-//     algoritmi tekee skip-päätöksen.
-//   · Herkkyys-liuku = säätää T_high/T_low/dwell aggressiivisuutta
+//  1. EVERY signal is z-score-normalised against the user's own baseline
+//     (Welford mean+variance for 30 samples, then EWMA α=0.05). This means
+//     the FIRST ~30 SECONDS are "calibration" — the algorithm just collects
+//     baseline data and skips less frequently.
+//
+//  2. We compute a UNIFIED disinterest score D(t) as a weighted sum of
+//     per-modality z-scores (yaw 0.20, gazeOff 0.20, pupil 0.15 inverted,
+//     blink 0.10, AU4 brow-down 0.10, AU43 eyes-closed 0.10, smile 0.10
+//     inverted, sacc 0.05, HR 0.05, pitch 0.10).
+//
+//  3. MULTI-MODAL AND-GATE: at least N modalities must cross the threshold
+//     before the algorithm arms itself. N depends on the sensitivity slider:
+//     sensitivity 0   → N=2 (patient)
+//     sensitivity 100 → N=1 (aggressive, any clear signal triggers)
+//
+//  4. SCHMITT TRIGGER + DWELL: once D(t) crosses T_high, a timer starts.
+//     When the timer hits "dwell" (1.0–1.5 s), the video is skipped. While
+//     the timer runs, a pink PRE-ACTION BAR fills over the meter so the user
+//     can see a skip is coming and pull their hand up or focus on the video
+//     intensely — that drops D below T_low and the Schmitt disarms.
+//
+//  5. GESTURES override the algorithm:
+//        Hand down (scene camera)  → immediate skip
+//        Hand up   (scene camera)  → back to the previous Short (ArrowUp)
+//        Head shake               → immediate skip (escape hatch)
+//        Head nod                 → keep (suppresses the skip)
+//
+// =============================================================================
+//   What you see in the UI and what it means
+// =============================================================================
+//   · Vertical METER on the left = engagement estimate 0..100% (cosmetic)
+//   · PINK bar over the meter = pre-action indicator (skip imminent, you
+//     have a window to cancel it)
+//   · "interesting / neutral / boring" = textual state
+//   · Modalities row (e.g. "yaw=1.2 pupil=-0.4 blink=0.8") = each signal's
+//     live z-score. Red numbers exceed T_high — those drive the skip decision.
+//   · Sensitivity slider = adjusts T_high / T_low / dwell aggressiveness
 //   · Bottom-hint = mitä ele tekisi nyt
 //   · ⏻-nappi = päälle/pois kytkin
 
@@ -90,15 +89,15 @@
       </div>
       <div class="__d-shorts-row __d-shorts-mods" id="__ds-mods"></div>
       <div class="__d-shorts-row __d-shorts-sens">
-        <span class="__d-shorts-sens-lbl">herkkyys</span>
+        <span class="__d-shorts-sens-lbl">sensitivity</span>
         <input type="range" id="__ds-sens" min="0" max="100" value="${sensitivity}">
         <span id="__ds-sens-val">${sensitivity}</span>
       </div>
       <div class="__d-shorts-row __d-shorts-hint" id="__ds-hint">
-        ele alas = skip · ele ylös = pidempään
+        hand down = skip · hand up = previous · shake = force-skip
       </div>
     </div>
-    <button class="__d-shorts-toggle" id="__ds-toggle" title="Päällä / pois">
+    <button class="__d-shorts-toggle" id="__ds-toggle" title="On / off">
       <span id="__ds-toggle-icon">${enabled ? '⏻' : '○'}</span>
     </button>
   `;
@@ -415,11 +414,11 @@
   }
 
   function classify(eng) {
-    if (eng > 0.72) return { emoji: '🔥', label: 'kiinnostaa' };
-    if (eng > 0.58) return { emoji: '😊', label: 'ihan kiva' };
-    if (eng > 0.42) return { emoji: '⚪', label: 'neutraali' };
-    if (eng > 0.28) return { emoji: '😐', label: 'tylsähköä' };
-    return { emoji: '💤', label: 'tylsä' };
+    if (eng > 0.72) return { emoji: '🔥', label: 'engaged' };
+    if (eng > 0.58) return { emoji: '😊', label: 'liking it' };
+    if (eng > 0.42) return { emoji: '⚪', label: 'neutral' };
+    if (eng > 0.28) return { emoji: '😐', label: 'losing it' };
+    return { emoji: '💤', label: 'bored' };
   }
 
   let lastEng = 0.5;
@@ -582,21 +581,21 @@
 
   function flashSkip(reason) {
     ui.classList.add('__d-skipping');
-    hintEl.textContent = reason === 'shake'        ? '↺ pää pudistus → skip'
-                       : reason === 'gesture'      ? '👇 ele → skip'
-                       : reason === 'disinterest'  ? '✕ kiinnostus loppui → skip'
+    hintEl.textContent = reason === 'shake'        ? '↺ head shake → skip'
+                       : reason === 'gesture'      ? '👇 hand gesture → skip'
+                       : reason === 'disinterest'  ? '✕ engagement lost → skip'
                        :                             '✕ skip';
     setTimeout(() => {
       ui.classList.remove('__d-skipping');
-      hintEl.textContent = 'ele alas = skip · ele ylös = pidempään · pudistus = pakkoskip';
+      hintEl.textContent = 'hand down = skip · hand up = previous · shake = force-skip';
     }, 1500);
   }
   function flashKeep() {
     ui.classList.add('__d-keeping');
-    hintEl.textContent = '↑ ele/nyökkäys → pidetään pidempään';
+    hintEl.textContent = '↑ hand up / nod → keep watching';
     setTimeout(() => {
       ui.classList.remove('__d-keeping');
-      hintEl.textContent = 'ele alas = skip · ele ylös = pidempään · pudistus = pakkoskip';
+      hintEl.textContent = 'hand down = skip · hand up = previous · shake = force-skip';
     }, 1500);
   }
 

@@ -101,7 +101,7 @@
         </div>
 
         <div class="__d-cell __d-wide" id="__d-scene-cell" style="display:none">
-          <div class="__d-section-label">LASIEN KAMERA · gaze overlay
+          <div class="__d-section-label">GLASSES SCENE · gaze overlay
             <span class="__d-hint" id="__d-scene-hint">native cv2 window</span>
           </div>
           <canvas id="__d-scene" width="240" height="180"></canvas>
