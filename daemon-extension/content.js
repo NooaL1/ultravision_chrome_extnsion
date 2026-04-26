@@ -89,16 +89,20 @@
           </div>
         </div>
 
-        <div class="__d-cell __d-wide" id="__d-webcam-cell">
+        <!-- WEBCAM- ja LASIEN KAMERA -solut piilotettu oletuksena.
+             Videokuvat näkyvät natiivissa cv2-ikkunassa bridge.py:n kautta
+             (sulavampi, ei chrome msg-passing-overheadia).
+             Cellit jätetty DOMiin ettei content.js:n koodi tarvitse muutoksia. -->
+        <div class="__d-cell __d-wide" id="__d-webcam-cell" style="display:none">
           <div class="__d-section-label">WEBCAM · face mesh
-            <span class="__d-hint">live preview</span>
+            <span class="__d-hint">native cv2 window</span>
           </div>
           <canvas id="__d-webcam" width="240" height="180"></canvas>
         </div>
 
-        <div class="__d-cell __d-wide" id="__d-scene-cell">
+        <div class="__d-cell __d-wide" id="__d-scene-cell" style="display:none">
           <div class="__d-section-label">LASIEN KAMERA · gaze overlay
-            <span class="__d-hint" id="__d-scene-hint">offline</span>
+            <span class="__d-hint" id="__d-scene-hint">native cv2 window</span>
           </div>
           <canvas id="__d-scene" width="240" height="180"></canvas>
         </div>

@@ -447,12 +447,11 @@ function loop() {
     send({ face: false });
   }
 
-  // Webkameran preview — JOKA framella jotta video näyttää sulavalta.
-  // MediaPipe-landmarkit cachataan _lastFaceLandmarks:iin (ne päivittyvät
-  // hitaammin, mutta video-kuva ei jää jumiin niiden vuoksi).
-  if (frame % 2 === 0) {   // ~15 fps preview update — riittävä, säästää CPU:ta
-    renderWebcamPreview(_lastFaceLandmarks);
-  }
+  // Webkameran preview Chromeen on POISTETTU — natiivit cv2-ikkunat
+  // bridgessä näyttävät sekä webcam-kuvan että lasit-kameran ja gaze-pisteen
+  // huomattavasti sulavammin (ei chrome.runtime.sendMessage-overheadia).
+  // Jos haluat preview takaisin Chromeen: poista alla oleva early-return.
+  // if (frame % 2 === 0) renderWebcamPreview(_lastFaceLandmarks);
 
   frame++;
   scheduleNext();

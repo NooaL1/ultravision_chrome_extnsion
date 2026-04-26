@@ -417,12 +417,8 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
     style  = mp.solutions.drawing_styles
 
     if show_window:
-        cv.namedWindow("Gesture debug", cv.WINDOW_NORMAL)
-        cv.resizeWindow("Gesture debug", 800, 600)
-        # ÄLÄ pelkästään näytä eleitä — avaa myös ISO scene-cam-ikkuna jossa
-        # näkyy lasit-kameran kuva + gaze-piste reaaliajassa. Tämä on demoa
-        # varten huomattavasti sulavampi kuin Chrome-paneelin scene-view koska
-        # ei msg-passing-overheadia. Natiivi-fps (~30 fps).
+        # VAIN yksi ikkuna gesture_workerista: scene-cam + gaze + ele-overlay.
+        # Aiempi "Gesture debug" oli duplikaatti samasta lähteestä.
         cv.namedWindow("Lasien kamera + gaze", cv.WINDOW_NORMAL)
         cv.resizeWindow("Lasien kamera + gaze", 960, 720)
 
@@ -478,18 +474,12 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
         h, w = img.shape[:2]
         hand_ok = results is not None and results.multi_hand_landmarks
 
-        # ── Stream pieni scene-frame Daemon HUDille ──────────────────────
-        # Joka 2. kuva (~15 fps), 320×240 JPEG q70.
-        # JSON-relayn ja Chrome-extensionin msg-passingin overhead on iso
-        # kun viesti on isohko base64. Aiempi 240x180 + 10 fps näytti
-        # silti ~10 fpm — ongelma oli että payload uusiutui niin nopeasti
-        # ettei content-script ehtinyt purkaa Image:a. Nyt: korkeampi
-        # resoluutio (selvempi näkymä), q70 (parempi laatu pienissä
-        # muutoksissa) mutta lähetetään harvemmin (skipataan jos jonossa
-        # on jo data).
-        if frame_idx % 2 == 0:
+        # Aiemmin streamasimme scene-cam JPEG:nä Chromen HUDille mutta
+        # base64-paljous + chrome.runtime.sendMessage broadcast tappoi fps:n.
+        # Nyt scene näkyy vain natiivi-cv2-ikkunassa (sulava 30 fps).
+        # Jos joskus halutaan myös Chrome-paneeliin: poista False-gate.
+        if False and frame_idx % 2 == 0:
             try:
-                # Skippaa jos jono on lähes täynnä — vältetään kasaantuminen
                 if gesture_q.qsize() < 32:
                     small = cv.resize(img, (320, 240),
                                       interpolation=cv.INTER_AREA)
@@ -498,10 +488,8 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
                     if ok:
                         b64 = base64.b64encode(buf.tobytes()).decode("ascii")
                         gesture_q.put_nowait({
-                            "source": "ovision-scene",
-                            "ts": now,
-                            "w": 320, "h": 240,
-                            "jpeg": b64,
+                            "source": "ovision-scene", "ts": now,
+                            "w": 320, "h": 240, "jpeg": b64,
                         })
             except Exception:
                 pass
@@ -638,12 +626,11 @@ def gesture_worker(remote_ip: str, gesture_q, bind_mode: bool = False,
                        cv.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3, cv.LINE_AA)
 
         if show_window:
-            cv.imshow("Gesture debug", img)
-
             # ── Scene-cam + gaze overlay -ikkuna ─────────────────────────
             # Käyttää alkuperäistä isoa scene-frameä (640x480 tai mitä
             # SeeTrue lähettää), piirtää siihen gaze-pisteen shared
-            # memorystä. Natiivi-fps, paljon sulavampi kuin Chrome-panelissa.
+            # memorystä JA käden eleet. Natiivi-fps, paljon sulavampi
+            # kuin Chrome-panelissa. Yksi ikkuna riittää.
             scene_disp = img.copy()
             sH, sW = scene_disp.shape[:2]
             gx_norm = gy_norm = pup_l = pup_r = 0.0
@@ -901,9 +888,12 @@ async def main():
     parser.add_argument("--remote_ip", default="172.20.10.3",
         help="SeeTrue device IP (when --bind not set). Default: 172.20.10.3 "
              "(matches simple_gaze_receiver/main.py default).")
-    parser.add_argument("--enable-webcam", action="store_true",
-        help="Run the webcam_worker (face mesh + hand). OFF by default — "
-             "Daemon-laajennus tekee saman tehokkaammin selainpuolella.")
+    parser.add_argument("--no-webcam", action="store_true",
+        help="Älä käynnistä webcam_workeria. Oletuksena se avaa toisen "
+             "cv2-ikkunan jossa näkyy laptopin etukamerasta livenä kasvot + "
+             "MediaPipe face-mesh. Jos Daemon-laajennuksen rPPG vaatii "
+             "webkameran samanaikaisesti, tämä voi epäonnistua → käytä "
+             "--no-webcam jolloin vain lasit-kameran ikkuna avataan.")
     parser.add_argument("--no-gesture", action="store_true",
         help="Skip the MediaPipe hand-gesture worker entirely. Saves "
              "~150 MB RAM if you only need SeeTrue gaze data.")
@@ -937,7 +927,7 @@ async def main():
     direction_scene = (f"bind   tcp://0.0.0.0:{SCENE_PORT}" if bind_mode
                        else f"connect tcp://{args.remote_ip}:{SCENE_PORT}")
     gesture_state = "off" if args.no_gesture else ("on (window)" if show_window else "on (headless)")
-    webcam_state  = "off" if not args.enable_webcam else ("on (window)" if show_window else "on (headless)")
+    webcam_state  = "off" if args.no_webcam else ("on (window)" if show_window else "on (headless)")
     print("=" * 64)
     print("  bridge.py  ·  SeeTrue ↔ WebSocket fusion")
     print(f"  ZMQ gaze:   {direction_gaze}")
@@ -1005,14 +995,14 @@ async def main():
     else:
         print("[Bridge] gesture worker disabled (--no-gesture)")
 
-    if args.enable_webcam:
+    if not args.no_webcam:
         cam_proc = mpr.Process(target=webcam_worker,
                                args=(gesture_q, 0, show_window),
                                daemon=True)
         cam_proc.start()
-        print(f"[Bridge] webcam worker pid={cam_proc.pid}")
+        print(f"[Bridge] webcam worker pid={cam_proc.pid} (toinen cv2-ikkuna)")
     else:
-        print("[Bridge] webcam worker disabled (use --enable-webcam to opt in)")
+        print("[Bridge] webcam worker disabled (--no-webcam)")
 
     server = await serve(ws_handler, WS_HOST, WS_PORT)
     print(f"[WS] listening on ws://{WS_HOST}:{WS_PORT}")
